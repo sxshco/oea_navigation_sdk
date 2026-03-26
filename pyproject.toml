@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "go2-navigation-mcp"
+version = "0.1.0"
+description = "MCP server for RGB-D target search and navigation on Unitree Go2."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "Pillow>=9.0",
+  "websockets>=12.0",
+  "scipy>=1.11",
+  "opencv-python-headless>=4.10",
+  "torch>=2.8",
+  "torchvision>=0.23",
+  "ultralytics>=8.3",
+]
+
+[project.scripts]
+go2-navigation-mcp = "navigation_mcp.server:main"
+
+[tool.setuptools]
+packages = ["navigation_mcp"]

@@ -1,0 +1,13 @@
+numpy
+Pillow
+websockets
+scipy
+opencv-python-headless
+torch==2.7.*
+torchvision==0.22.*
+torchaudio==2.7.*
+ultralytics
+pycocotools
+einops
+pynput
+pyaudio

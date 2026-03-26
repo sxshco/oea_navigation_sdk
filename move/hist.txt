@@ -1,0 +1,5385 @@
+import cv2
+import pyaudio
+import socket
+import threading
+import numpy as np
+import struct
+import time
+import math
+
+# 配置
+VIDEO_PORT = 5220
+AUDIO_PORT = 5221
+DEST_IP = '192.168.86.16'
+
+CHUNK = 1024
+FORMAT = pyaudio.paInt16
+# 定义输入和输出通道数（ReSpeaker 4 Mic Array 实际为6输入通道）
+INPUT_CHANNELS = 6  
+OUTPUT_CHANNELS = 2 
+RATE = 16000
+VEDIO_INDEX = 4  # 摄像头索引保留原配置
+
+# 目标麦克风名称（关键匹配字符串，无需完全一致，包含即可）
+TARGET_MIC_NAME = "ReSpeaker 4 Mic Array (UAC1.0): USB Audio"
+
+video_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+
+def get_respeaker_index():
+    """
+    按设备名称查找ReSpeaker麦克风的索引
+    返回：找到的设备索引（int），未找到则返回None
+    """
+    p = None
+    try:
+        p = pyaudio.PyAudio()
+        device_count = p.get_device_count()
+        print(f"正在遍历 {device_count} 个音频设备，查找目标麦克风：{TARGET_MIC_NAME}")
+        
+        # 遍历所有音频设备，筛选输入设备并匹配名称
+        for idx in range(device_count):
+            dev_info = p.get_device_info_by_index(idx)
+            # 只关注输入设备（maxInputChannels > 0）
+            if dev_info.get('maxInputChannels') <= 0:
+                continue
+            
+            # 打印所有可用输入设备（方便调试）
+            dev_name = dev_info.get('name', '未知设备')
+            #print(f"  设备{idx}：{dev_name}（输入通道数：{dev_info['maxInputChannels']}）")
+            
+            # 匹配目标设备名称（包含关键字符串即可，避免名称细微差异导致匹配失败）
+            if TARGET_MIC_NAME in dev_name:
+                print(f"\n找到目标ReSpeaker麦克风！索引：{idx}")
+                return idx
+        
+        # 遍历结束未找到
+        print(f"\n未找到名称包含「{TARGET_MIC_NAME}」的麦克风设备")
+        return None
+    except Exception as e:
+        print(f"查找麦克风设备时出错：{e}")
+        return None
+    finally:
+        # 释放pyaudio资源
+        if p is not None:
+            p.terminate()
+
+
+def send_audio():
+    # 第一步：先获取ReSpeaker麦克风的索引
+    respeaker_index = get_respeaker_index()
+    # 若未找到目标设备，直接退出音频线程（避免后续无效执行）
+    if respeaker_index is None:
+        print("音频发送线程因未找到目标麦克风终止")
+        return
+
+    while True:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        print("\n连接音频接收端", (DEST_IP, AUDIO_PORT))
+        # 尝试连接，直到成功
+        while True:
+            try:
+                s.connect((DEST_IP, AUDIO_PORT))
+                break
+            except Exception as e:
+                print("等待音频接收端上线...", e)
+                time.sleep(0.1)
+        print("已连接音频接收端！")
+
+        p = None
+        stream = None
+        try:
+            p = pyaudio.PyAudio()
+            # 打开麦克风流：使用动态获取的ReSpeaker索引，而非硬编码AUDIO_INDEX
+            stream = p.open(
+                format=FORMAT,
+                channels=INPUT_CHANNELS,  # ReSpeaker 6声道输入
+                rate=RATE,
+                input=True,
+                input_device_index=respeaker_index,  # 动态匹配的索引
+                frames_per_buffer=CHUNK
+            )
+            # 发送音频参数（输出通道数、采样率）
+            s.sendall(struct.pack("<HH", OUTPUT_CHANNELS, RATE))
+            print(f"已发送音频参数：channels={OUTPUT_CHANNELS}, rate={RATE}")
+
+            while True:
+                # 读取6通道音频数据
+                data = stream.read(CHUNK, exception_on_overflow=False)
+                # 转换为numpy数组处理通道
+                audio_array = np.frombuffer(data, dtype=np.int16).reshape(-1, INPUT_CHANNELS)
+
+                # 通道组合逻辑（保留原逻辑：丢弃0/5通道，1+4为右声道，2+3为左声道）
+                right_channel = (audio_array[:, 1].astype(np.int32) + audio_array[:, 4].astype(np.int32))
+                left_channel = (audio_array[:, 2].astype(np.int32) + audio_array[:, 3].astype(np.int32))
+
+                # 创建立体声交错数据
+                stereo_data = np.empty((left_channel.size + right_channel.size,), dtype=np.int16)
+                stereo_data[0::2] = left_channel
+                stereo_data[1::2] = right_channel
+
+                # 发送数据（长度+实际数据）
+                data_to_send = stereo_data.tobytes()
+                s.sendall(struct.pack("!I", len(data_to_send)))
+                s.sendall(data_to_send)
+
+        except Exception as e:
+            print("音频发送/TCP连接异常:", e)
+        finally:
+            # 安全释放资源（避免资源泄漏）
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except Exception:
+                    pass
+            if p is not None:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+            print("准备自动重连音频socket...")
+
+
+def send_video():
+    cap = cv2.VideoCapture(VEDIO_INDEX)
+    if not cap.isOpened():
+        print('无法打开摄像头')
+        return
+    print('本地video_socket:', video_socket.getsockname())
+    print('将向', (DEST_IP, VIDEO_PORT), '发送视频数据')
+    print('开始采集并发送视频...')
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 60]
+            _, img_encoded = cv2.imencode('.jpg', frame, encode_param)
+            data = img_encoded.tobytes()
+            max_size = 60000
+            total = math.ceil(len(data) / max_size)
+            frame_id = int(time.time()*1000) & 0xFFFFFFFF  # 4字节
+            for i in range(total):
+                packet = data[i * max_size:(i + 1) * max_size]
+                head = struct.pack("!IHHH", frame_id, total, i, len(packet))
+                video_socket.sendto(head + packet, (DEST_IP, VIDEO_PORT))
+            time.sleep(0.02)
+    except KeyboardInterrupt:
+        print("视频发送终止")
+    finally:
+        cap.release()
+
+
+if __name__ == "__main__":
+    audio_thread = threading.Thread(target=send_audio, daemon=True)
+    video_thread = threading.Thread(target=send_video, daemon=True)
+    audio_thread.start()
+    video_thread.start()
+    try:
+        while True:
+            threading.Event().wait(1)
+    except KeyboardInterrupt:
+        print("发送端退出")
+    finally:
+        video_socket.close()  # 补充关闭视频socket
+        print("网络连接已关闭")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from nav_msgs.msg import Odometry
+from scipy.spatial.transform import Rotation
+import socket
+import struct
+import time
+import threading
+
+# ================================================================
+#  常量定义 (Constants)
+# ================================================================
+# 您运行数据接收服务器的PC的IP地址
+SERVER_HOST_IP = '192.168.86.16' # 请确保这是您服务器的正确IP
+STATE_PORT = 5222                 # 为状态数据分配一个新的端口
+RECONNECT_DELAY_S = 5             # 连接断开后的重连延迟（秒）
+
+class StateSenderNode(Node):
+    """
+    该节点订阅机器人的里程计信息，提取[x, y, yaw]状态，
+    并通过TCP连接发送到远程服务器。
+    """
+    def __init__(self, server_host=SERVER_HOST_IP, server_port=STATE_PORT):
+        super().__init__('state_sender_node')
+
+        self.server_addr = (server_host, server_port)
+        self.sock = None
+        self.running = True
+        
+        # 订阅机器人里程计话题
+        self.odom_subscription = self.create_subscription(
+            Odometry,
+            '/utlidar/robot_odom',
+            self.odometry_callback,
+            10
+        )
+        self.get_logger().info(f"订阅里程计话题: '/utlidar/robot_odom'")
+
+        # 在一个独立的线程中管理网络连接和发送
+        self.network_thread = threading.Thread(target=self.network_loop, daemon=True)
+        self.network_thread.start()
+
+    def odometry_callback(self, msg: Odometry):
+        """
+        当收到新的Odometry消息时，提取数据并发送。
+        """
+        if not self.sock:
+            # 如果套接字未连接，则不执行任何操作
+            return
+
+        # 1. 提取位置 (x, y)
+        x = msg.pose.pose.position.x
+        y = msg.pose.pose.position.y
+
+        # 2. 提取姿态四元数并计算偏航角 (yaw)
+        q = msg.pose.pose.orientation
+        rotation = Rotation.from_quat([q.x, q.y, q.z, q.w])
+        # as_euler('xyz') -> [roll, pitch, yaw]
+        yaw = rotation.as_euler('xyz', degrees=False)[2]
+
+        # 3. 将数据打包成二进制格式
+        # 'ddd' 表示三个 double-precision float (8 bytes each)
+        # '!' 表示网络字节序 (大端)
+        try:
+            # 打包数据
+            payload = struct.pack('!ddd', x, y, yaw)
+            
+            # 添加4字节的长度前缀
+            message = struct.pack('!I', len(payload)) + payload
+            
+            # 发送数据
+            self.sock.sendall(message)
+            self.get_logger().debug(f"已发送状态: x={x:.3f}, y={y:.3f}, yaw={yaw:.3f}")
+        
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            self.get_logger().error(f"发送数据时连接断开: {e}")
+            # 关闭错误的套接字，网络循环将进行重连
+            if self.sock:
+                self.sock.close()
+            self.sock = None
+        except Exception as e:
+            self.get_logger().error(f"发送状态时发生未知错误: {e}")
+
+    def network_loop(self):
+        """
+        在一个循环中保持与服务器的连接。
+        """
+        while self.running:
+            try:
+                self.get_logger().info(f"正在尝试连接到状态服务器 {self.server_addr}...")
+                # 创建一个新的TCP套接字
+                client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                client_socket.connect(self.server_addr)
+                self.sock = client_socket
+                self.get_logger().info(f"✅ 已成功连接到状态服务器。")
+
+                # 保持线程存活，直到连接断开
+                # 通过定期发送一个小的keep-alive包来检测连接是否断开
+                while self.running:
+                    time.sleep(1)
+                    # 发送一个心跳包（例如4字节的0）来检查连接
+                    self.sock.sendall(struct.pack('!I', 0))
+
+            except (ConnectionRefusedError, TimeoutError, OSError) as e:
+                self.get_logger().warn(f"连接状态服务器失败: {e}。将在 {RECONNECT_DELAY_S} 秒后重试...")
+                if self.sock:
+                    self.sock.close()
+                self.sock = None
+            
+            if not self.running:
+                break
+                
+            time.sleep(RECONNECT_DELAY_S)
+        
+        if self.sock:
+            self.sock.close()
+        self.get_logger().info("网络线程已停止。")
+
+    def destroy_node(self):
+        """节点销毁时确保线程和套接字被关闭"""
+        self.running = False
+        if self.sock:
+            self.sock.close()
+        self.network_thread.join(timeout=1.0)
+        super().destroy_node()
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = StateSenderNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("接收到Ctrl+C，节点关闭。")
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+
+
+
+
+
+
+
+
+
+#!/usr/bin/env python3
+import asyncio
+import json
+import threading
+import time
+from enum import IntEnum
+
+import numpy as np
+import rclpy
+from rclpy.node import Node
+from scipy.spatial.transform import Rotation
+from sensor_msgs.msg import Imu, PointCloud2, PointField
+from unitree_api.msg import Request, RequestHeader, RequestIdentity
+import websockets
+
+# ================================================================
+#  常量定义 (Constants)
+# ================================================================
+SERVER_HOST_IP = '192.168.86.16'
+SERVER_PORT = 8000
+
+GRAVITY = np.array([0, 0, -9.81])
+BIAS_SAMPLES_COUNT = 200
+
+# 原子动作的目标值
+TARGET_FORWARD_DISTANCE_M = 0.25
+TARGET_SIDEWARD_DISTANCE_M = 0.20 # 避障时的横向移动目标距离
+TARGET_TURN_ANGLE_DEG = 30.0
+
+class ApiId(IntEnum):
+    DAMP = 1001
+    BALANCESTAND = 1002
+    STOPMOVE = 1003
+    STANDUP = 1004
+    SITDOWN = 1005
+    MOVE = 1008
+
+# ================================================================
+#  主节点类 (Main Node Class)
+# ================================================================
+
+class Go2MotionNode(Node):
+    def __init__(self, server_host=SERVER_HOST_IP, server_port=SERVER_PORT):
+        super().__init__('go2_motion_node')
+
+        # === 网络与ROS通信 ===
+        self.server_url = f"ws://{server_host}:{server_port}"
+        self.websocket = None
+        self.running = True
+        self.ws_thread = threading.Thread(target=self._start_ws_client_loop, daemon=True)
+        self.ws_thread.start()
+
+        self.sub_imu = self.create_subscription(Imu, '/utlidar/imu', self.imu_callback, 100)
+        self.pub_request = self.create_publisher(Request, '/api/sport/request', 10)
+        
+        self.sub_lidar = self.create_subscription(PointCloud2, '/livox/lidar', self.lidar_callback, 10)
+        self.latest_cloud = None
+
+        # === 状态与积分变量 ===
+        self.last_imu_time = None
+        self.velocity = np.zeros(3)
+        self.position = np.zeros(3)
+        self.bias_acc = np.zeros(3)
+        self.bias_samples = []
+        self.integrating = False
+        self.start_orientation_q = None
+        self.current_orientation_q = None
+        self.target_displacement_body = np.zeros(3)
+        self.target_yaw_change_rad = 0.0
+        self.total_drift_2d = np.zeros(2)
+        self.is_pure_rotation = False
+        
+        T_raw = np.array([
+            [0.9743701,  0.0,       -0.2249511,  0.1870],
+            [0.0,        1.0,        0.0,        0.0   ],
+            [0.2249511,  0.0,        0.9743701,  0.0803],
+            [0.0,        0.0,        0.0,        1.0   ]
+        ], dtype=np.float32)
+        self.T_lidar_calib = np.linalg.inv(T_raw)
+
+
+    async def _handle_websocket_message(self, message):
+        try:
+            data = json.loads(message); api_id = data.get("api_id")
+            parameter = data.get("parameter", {});
+            if api_id is not None: self.process_command(api_id, parameter)
+        except Exception as e: self.get_logger().error(f"处理WebSocket消息时出错: {e}")
+    async def _connect_and_listen(self):
+        while self.running:
+            try:
+                async with websockets.connect(self.server_url, ping_interval=10) as ws:
+                    self.websocket = ws; self.get_logger().info("✅ 已连接到上层控制端")
+                    async for msg in ws: await self._handle_websocket_message(msg)
+            except Exception as e:
+                self.get_logger().error(f"WebSocket连接失败或断开: {e}，5秒后重连...")
+                await asyncio.sleep(5)
+    def _start_ws_client_loop(self):
+        loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._connect_and_listen())
+
+
+    def lidar_callback(self, msg: PointCloud2):
+        self.latest_cloud = msg
+
+    def imu_callback(self, msg: Imu):
+        self.current_orientation_q = np.array([msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w])
+        t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        if self.last_imu_time is None: self.last_imu_time = t; return
+        dt = t - self.last_imu_time
+        self.last_imu_time = t
+        if dt <= 0 or dt > 0.1: return
+        acc_raw_remapped = np.array([-msg.linear_acceleration.y, msg.linear_acceleration.x, msg.linear_acceleration.z])
+        if not self.integrating:
+            self.bias_samples.append(acc_raw_remapped)
+            if len(self.bias_samples) > BIAS_SAMPLES_COUNT:
+                self.bias_acc = np.mean(self.bias_samples[-BIAS_SAMPLES_COUNT:], axis=0)
+                self.bias_samples.pop(0)
+            return
+        if self.is_pure_rotation: return
+        try: R = Rotation.from_quat(self.current_orientation_q).as_matrix()
+        except (ValueError, TypeError): self.get_logger().warn("接收到无效的四元数，跳过此帧"); return
+        gravity_in_body = R.T @ GRAVITY
+        acc_body_net = acc_raw_remapped - self.bias_acc - gravity_in_body
+        acc_world_net = R @ acc_body_net
+        acc_world_net[2] = 0.0
+        self.position += self.velocity * dt + 0.5 * acc_world_net * dt**2
+        self.velocity += acc_world_net * dt
+
+
+    def start_integration(self, target_displacement_body_m, target_yaw_change_rad):
+        if self.current_orientation_q is None: self.get_logger().error("错误：无法开始积分，尚未收到任何IMU数据。"); return
+        self.get_logger().info(f"🚀 开始积分... 目标位移: {np.round(target_displacement_body_m[0:2], 3)} m (Body Frame), "
+                               f"目标转角: {np.round(np.degrees(target_yaw_change_rad), 2)}°")
+        self.velocity[:], self.position[:] = 0, 0
+        self.target_displacement_body = np.array(target_displacement_body_m)
+        self.target_yaw_change_rad = target_yaw_change_rad
+        self.start_orientation_q = self.current_orientation_q.copy()
+        self.integrating = True
+
+    def stop_integration(self):
+        if not self.integrating: return
+        self.integrating = False
+        try:
+            rot_start = Rotation.from_quat(self.start_orientation_q); rot_end = Rotation.from_quat(self.current_orientation_q)
+        except (ValueError, TypeError): self.get_logger().error("停止积分时姿态数据无效，无法计算误差。"); return
+        actual_pos_in_start_body_frame = rot_start.inv().apply(self.position)
+        pos_error_body = actual_pos_in_start_body_frame - self.target_displacement_body
+        pos_error_dist_2d = np.linalg.norm(pos_error_body[0:2])
+        relative_rotation = rot_end * rot_start.inv()
+        actual_yaw_change_rad = relative_rotation.as_euler('xyz', degrees=False)[2]
+        yaw_error_rad = actual_yaw_change_rad - self.target_yaw_change_rad
+        if not self.is_pure_rotation:
+            error_in_world_frame = rot_start.apply(pos_error_body)
+            self.total_drift_2d += error_in_world_frame[0:2]
+        self.get_logger().info(
+            f"🎯 动作结束 | "
+            f"本体位移: 实际={actual_pos_in_start_body_frame[0:2].round(3)}m, 平面距离误差={pos_error_dist_2d:.3f}m | "
+            f"转角: 实际={np.degrees(actual_yaw_change_rad):.2f}°, 误差={np.degrees(yaw_error_rad):.2f}°"
+        )
+
+    def transform_cloud(self, msg: PointCloud2):
+        try:
+            dtype_list = [(f.name, np.float32) for f in msg.fields if f.datatype == PointField.FLOAT32]
+            if not dtype_list: return None
+            arr = np.frombuffer(msg.data, dtype=np.dtype(dtype_list))
+            if 'x' not in arr.dtype.names: return None
+            mask_valid = np.isfinite(arr['x']) & np.isfinite(arr['y']) & np.isfinite(arr['z'])
+            arr = arr[mask_valid]
+            xyz = np.stack([arr['x'], arr['y'], arr['z']], axis=-1)
+            ones = np.ones((xyz.shape[0], 1), dtype=np.float32)
+            xyz_h = np.concatenate([xyz, ones], axis=1)
+            xyz_t = (self.T_lidar_calib @ xyz_h.T).T[:, :3]
+            return xyz_t
+        except Exception as e:
+            self.get_logger().error(f"点云转换失败: {e}")
+            return None
+
+    def region_clear(self, xyz, x_range, y_range, z_range=(-0.3, 0.2), threshold=20):
+        if xyz is None or len(xyz) == 0: return False
+        x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+        mask = (
+            (x > x_range[0]) & (x < x_range[1]) &
+            (y > y_range[0]) & (y < y_range[1]) &
+            (z > z_range[0]) & (z < z_range[1])
+        )
+        count = np.sum(mask)
+        clear = count < threshold
+        self.get_logger().debug(f"区域 {x_range}x{y_range}: 点数={count}, 是否清除={clear}")
+        return clear
+    
+    def try_move_with_obstacle_avoidance(self):
+        if self.latest_cloud is None:
+            self.get_logger().warn("避障失败：无雷达数据。")
+            return
+        xyz = self.transform_cloud(self.latest_cloud)
+        if xyz is None:
+            self.get_logger().warn("避障失败：无效的雷达数据。")
+            return
+
+        if self.region_clear(xyz, (0.0, 0.4), (-0.2, 0.2)):
+            self.get_logger().info("✅ 路径清晰 -> 前进")
+            target_disp = [TARGET_FORWARD_DISTANCE_M, 0.0, 0.0]
+            self.is_pure_rotation = False
+            self.start_integration(target_disp, 0.0)
+            self.forward_request_to_robot(ApiId.MOVE, {"x": 0.6, "y": 0.0, "z": 0.0})
+            return
+
+        if self.region_clear(xyz, (0.0, 0.4), (0.1, 0.4)) and self.region_clear(xyz, (-0.6, -0.0), (0.3, 0.4)):
+            self.get_logger().info("⚠️ 前方受阻，左侧清晰 -> 左移")
+            target_disp = [0.0, TARGET_SIDEWARD_DISTANCE_M, 0.0]
+            self.is_pure_rotation = False
+            self.start_integration(target_disp, 0.0)
+            self.forward_request_to_robot(ApiId.MOVE, {"x": 0.0, "y": 0.4, "z": 0.0})
+            return
+
+        if self.region_clear(xyz, (0.0, 0.4), (-0.4, -0.1)) and self.region_clear(xyz, (-0.6, -0.0), (-0.4, -0.3)):
+            self.get_logger().info("⚠️ 前方受阻，右侧清晰 -> 右移")
+            target_disp = [0.0, -TARGET_SIDEWARD_DISTANCE_M, 0.0]
+            self.is_pure_rotation = False
+            self.start_integration(target_disp, 0.0)
+            self.forward_request_to_robot(ApiId.MOVE, {"x": 0.0, "y": -0.4, "z": 0.0})
+            return
+            
+        self.get_logger().info("🚫 无安全路径 -> 保持不动")
+
+
+    def reset_drift(self): self.get_logger().info("✅ 检测到站起 → 重置累计漂移误差"); self.total_drift_2d[:] = 0
+    def report_drift(self): dist_2d = np.linalg.norm(self.total_drift_2d); self.get_logger().info(f"📊 坐下完成 → 累计平面漂移: {self.total_drift_2d.round(3)}m, 总平面距离差={dist_2d:.3f}m")
+
+    def process_command(self, api_id: int, parameter: dict):
+        if api_id == ApiId.MOVE:
+            x_vel = float(parameter.get("x", 0.0))
+            z_vel_rad = float(parameter.get("z", 0.0))
+            if abs(x_vel) > 1e-3:
+                self.try_move_with_obstacle_avoidance()
+            elif abs(z_vel_rad) > 1e-3:
+                self.is_pure_rotation = True
+                DEG_30_IN_RAD = np.deg2rad(TARGET_TURN_ANGLE_DEG)
+                target_yaw = DEG_30_IN_RAD if z_vel_rad > 0 else -DEG_30_IN_RAD
+                self.start_integration([0.0, 0.0, 0.0], target_yaw)
+                self.forward_request_to_robot(api_id, parameter)
+
+        elif api_id == ApiId.STOPMOVE:
+            self.stop_integration()
+            # === 关键修正 ===
+            # 将STOPMOVE指令转发给机器人，使其真正停止运动
+            self.forward_request_to_robot(api_id, parameter)
+            # ================
+
+        elif api_id == ApiId.BALANCESTAND:
+            self.reset_drift()
+            self.forward_request_to_robot(api_id, parameter) # 确保转发
+        elif api_id == ApiId.DAMP or api_id == ApiId.SITDOWN:
+            self.report_drift()
+            self.forward_request_to_robot(api_id, parameter) # 确保转发
+        else:
+            self.forward_request_to_robot(api_id, parameter)
+
+    def forward_request_to_robot(self, api_id, parameter):
+        req = Request()
+        req.header = RequestHeader(identity=RequestIdentity(api_id=int(api_id)))
+        req.parameter = json.dumps(parameter)
+        self.pub_request.publish(req)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = Go2MotionNode(server_host=SERVER_HOST_IP, server_port=SERVER_PORT)
+    try: rclpy.spin(node)
+    except KeyboardInterrupt: pass
+    finally:
+        node.running = False
+        node.get_logger().info("节点关闭。")
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+
+
+
+
+
+
+
+
+
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import PointCloud2, PointField
+from unitree_api.msg import Request
+from std_msgs.msg import Bool
+import numpy as np
+import json
+
+class LidarMoveNode(Node):
+    def __init__(self):
+        super().__init__('livox_obstacle_move')
+
+        # === 订阅原始雷达点云 ===
+        self.create_subscription(PointCloud2, '/livox/lidar', self.lidar_callback, 10)
+
+        # === 订阅触发信号 ===
+        self.create_subscription(Bool, '/action_trigger', self.trigger_callback, 10)
+
+        # === 发布运动命令 ===
+        self.cmd_pub = self.create_publisher(Request, '/api/sport/request', 10)
+
+        self.latest_cloud = None
+
+        # === 标定矩阵（方向校正） ===
+        T_raw = np.array([
+            [0.9743701,  0.0,       -0.2249511,  0.1870],
+            [0.0,        1.0,        0.0,        0.0   ],
+            [0.2249511,  0.0,        0.9743701,  0.0803],
+            [0.0,        0.0,        0.0,        1.0   ]
+        ], dtype=np.float32)
+        self.T = np.linalg.inv(T_raw)
+
+        self.get_logger().info("LidarMoveNode initialized. Waiting for /action_trigger...")
+
+    # ===============================
+    # 数据回调
+    # ===============================
+    def lidar_callback(self, msg: PointCloud2):
+        self.latest_cloud = msg
+
+    def trigger_callback(self, msg: Bool):
+        """外部触发信号"""
+        if msg.data:
+            self.get_logger().info("Received trigger: checking obstacle map before moving")
+            self.try_move_once()
+
+    # ===============================
+    # 点云转换
+    # ===============================
+    def transform_cloud(self, msg: PointCloud2):
+        """将PointCloud2转为numpy并做标定变换"""
+        dtype_list = []
+        for f in msg.fields:
+            if f.datatype == PointField.FLOAT32:
+                dt = np.float32
+            elif f.datatype == PointField.FLOAT64:
+                dt = np.float64
+            else:
+                continue
+            dtype_list.append((f.name, dt))
+        if not dtype_list:
+            return None
+
+        arr = np.frombuffer(msg.data, dtype=np.dtype(dtype_list))
+        if 'x' not in arr.dtype.names:
+            return None
+
+        mask_valid = np.isfinite(arr['x']) & np.isfinite(arr['y']) & np.isfinite(arr['z'])
+        arr = arr[mask_valid]
+
+        xyz = np.stack([arr['x'], arr['y'], arr['z']], axis=-1)
+        ones = np.ones((xyz.shape[0], 1), dtype=np.float32)
+        xyz_h = np.concatenate([xyz, ones], axis=1)
+
+        xyz_t = (self.T @ xyz_h.T).T[:, :3]
+        return xyz_t
+
+    # ===============================
+    # 区域判断函数
+    # ===============================
+    def region_clear(self, xyz, x_range, y_range, z_range=(-0.2, 0.5), threshold=20):
+        """判断指定矩形区域是否无障碍"""
+        if xyz is None or len(xyz) == 0:
+            return False
+
+        x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+        mask = (
+            (x > x_range[0]) & (x < x_range[1]) &
+            (y > y_range[0]) & (y < y_range[1]) &
+            (z > z_range[0]) & (z < z_range[1])
+        )
+        count = np.sum(mask)
+        clear = count < threshold
+        self.get_logger().info(f"Region {x_range}x{y_range}: points={count}, clear={clear}")
+        return clear
+
+    # ===============================
+    # 运动控制
+    # ===============================
+    def send_command(self, x, y, z):
+        """发布运动命令"""
+        req = Request()
+        req.header.identity.api_id = 1008
+        req.binary = [127]
+        req.parameter = json.dumps({"x": x, "y": y, "z": z})
+        self.cmd_pub.publish(req)
+        self.get_logger().info(f"Command sent: x={x}, y={y}, z={z}")
+
+    # ===============================
+    # 避障主逻辑
+    # ===============================
+    def try_move_once(self):
+        if self.latest_cloud is None:
+            self.get_logger().warn("No lidar data yet.")
+            return
+
+        xyz = self.transform_cloud(self.latest_cloud)
+        if xyz is None:
+            self.get_logger().warn("Invalid lidar data.")
+            return
+
+        # --- 检查前方区域 ---
+        if self.region_clear(xyz, (0.0, 0.4), (-0.2, 0.2)):
+            self.get_logger().info("!!!MOVE!!!, Path ahead clear → move forward 0.25 m.")
+            self.send_command(0.6, 0.0, 0.0)
+            return
+
+        # --- 检查左侧区域 ---
+        if self.region_clear(xyz, (0.0, 0.4), (0.1, 0.4)) and self.region_clear(xyz, (-0.6, -0.0), (0.3, 0.4)):
+            self.get_logger().info("!!!MOVE!!!, Front blocked, left side clear → move left 0.2 m.")
+            self.send_command(0.0, 0.4, 0.0)
+            return
+
+        # --- 检查右侧区域 ---
+        if self.region_clear(xyz, (0.0, 0.4), (-0.4, -0.1)) and self.region_clear(xyz, (-0.6, -0.0), (-0.4, -0.3)):
+            self.get_logger().info("!!!MOVE!!!, Front blocked, right side clear → move right 0.2 m.")
+            self.send_command(0.0, -0.4, 0.0)
+            return
+
+        # --- 全部有障碍 ---
+        self.get_logger().info("!!!MOVE!!!, No safe path detected — staying still.")
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = LidarMoveNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#!/usr/bin/env python3
+import asyncio
+import json
+import threading
+import socket
+import rclpy
+from rclpy.node import Node
+from unitree_api.msg import Request, RequestHeader, RequestIdentity
+from std_msgs.msg import Bool
+from sensor_msgs.msg import Imu
+import numpy as np
+import time
+import websockets
+
+DEST_IP = '192.168.86.23'
+
+
+def get_local_ip():
+    """获取当前设备的非回环IPv4地址"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            return ip
+    except Exception:
+        interfaces = socket.getaddrinfo(socket.gethostname(), None)
+        for addr in interfaces:
+            ip = addr[4][0]
+            if ip.startswith("127.") or ":" in ip:
+                continue
+            return ip
+    return "0.0.0.0"
+
+
+class WsClientNode(Node):
+    def __init__(self, name, user_host='192.168.86.111', user_port=8000):
+        super().__init__(name)
+        self.user_server_url = f"ws://{user_host}:{user_port}"
+        self.websocket = None
+        self.running = True
+
+        # === ROS2 通信 ===
+        self.pub_request = self.create_publisher(Request, '/api/sport/request', 10)
+        self.pub_trigger = self.create_publisher(Bool, '/action_trigger', 10)
+        self.create_subscription(Bool, '/action_trigger', self.on_trigger_received, 10)
+        self.create_subscription(Imu, '/livox/imu', self.imu_callback, 100)
+
+        # === IMU积分状态 ===
+        self.last_imu_time = None
+        self.velocity = np.zeros(3)
+        self.position = np.zeros(3)
+        self.total_drift = np.zeros(3)
+        self.integrating = False
+        self.last_move_start = None
+        self.target_displacement = np.zeros(3)
+
+        self.get_logger().info(f"✅ WebSocket客户端将连接用户服务器: {self.user_server_url}")
+
+        # 启动WebSocket线程
+        self.ws_thread = threading.Thread(target=self._start_ws_client_loop, daemon=True)
+        self.ws_thread.start()
+
+    # ==============================
+    # IMU积分逻辑
+    # ==============================
+    def imu_callback(self, msg: Imu):
+        """积分计算速度与位移"""
+        t = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        if self.last_imu_time is None:
+            self.last_imu_time = t
+            return
+        dt = t - self.last_imu_time
+        self.last_imu_time = t
+        if not self.integrating or dt <= 0 or dt > 0.5:
+            return
+
+        acc = np.array([
+            msg.linear_acceleration.x,
+            msg.linear_acceleration.y,
+            msg.linear_acceleration.z
+        ])
+        # 简单积分
+        self.velocity += acc * dt
+        self.position += self.velocity * dt
+
+    def start_integration(self, target):
+        """开始动作积分"""
+        self.velocity[:] = 0
+        self.position[:] = 0
+        self.integrating = True
+        self.last_move_start = time.time()
+        self.target_displacement = np.array(target)
+        self.get_logger().info(f"开始积分，目标位移: {self.target_displacement}")
+
+    def stop_integration(self):
+        """停止积分并计算误差"""
+        self.integrating = False
+        err = self.position - self.target_displacement
+        dist = np.linalg.norm(err)
+        self.total_drift += err
+        self.get_logger().info(
+            f"🎯 动作结束 | 实际={self.position}, 目标={self.target_displacement}, "
+            f"误差={err}, 距离差={dist:.3f} m"
+        )
+
+    def reset_drift(self):
+        """站立后重置累计误差"""
+        self.total_drift[:] = 0
+        self.get_logger().info("✅ 检测到站起完成 → 已重置累计漂移误差")
+
+    def report_drift(self):
+        """坐下后打印累计误差"""
+        dist = np.linalg.norm(self.total_drift)
+        self.get_logger().info(f"📊 坐下完成 → 累计漂移误差: {self.total_drift}, 距离差={dist:.3f} m")
+
+    # ==============================
+    # 触发逻辑
+    # ==============================
+    def on_trigger_received(self, msg: Bool):
+        if msg.data:
+            self.get_logger().info("⚡ 收到 /action_trigger → 启动避障前进0.25米")
+            self.start_integration([0.25, 0.0, 0.0])
+            # 使用计时器自动停止积分（控制层会自己停）
+            self.create_timer(2.0, self.stop_integration)
+
+    # ==============================
+    # WebSocket指令解析
+    # ==============================
+    def publish_request(self, api_id, parameter, binary):
+        """根据API类型触发对应逻辑"""
+        try:
+            param_dict = json.loads(parameter) if isinstance(parameter, str) else parameter
+            x_val = float(param_dict.get("x", 0.0))
+
+            # === 检测移动命令 ===
+            if api_id == 1008 and x_val > 0:
+                self.get_logger().info(f"检测到前进命令 (x={x_val}) → 触发避障逻辑")
+                trig = Bool()
+                trig.data = True
+                self.pub_trigger.publish(trig)
+                return
+
+            # === 检测站起/坐下结束 ===
+            if api_id == 1002:  # BALANCESTAND -> 站立结束
+                self.reset_drift()
+            elif api_id == 1001:  # DAMP -> 坐下结束
+                self.report_drift()
+
+        except Exception as e:
+            self.get_logger().warn(f"解析parameter失败: {parameter}, 错误: {e}")
+
+        # === 默认直接透传到机器狗 ===
+        msg = Request()
+        msg.header = RequestHeader()
+        msg.header.identity = RequestIdentity()
+        msg.header.identity.api_id = api_id
+        msg.parameter = parameter
+        msg.binary = [int(x) & 0xFF for x in binary]
+        self.pub_request.publish(msg)
+        self.get_logger().info(f"已发布请求到 /api/sport/request: api_id={api_id}, parameter={parameter}")
+
+    # ==============================
+    # WebSocket逻辑
+    # ==============================
+    async def _handle_websocket_message(self, message):
+        try:
+            data = json.loads(message)
+            api_id = data.get("api_id")
+            parameter = json.dumps(data.get("parameter", {}))
+            binary = data.get("binary", [])
+            if api_id is not None:
+                self.publish_request(api_id, parameter, binary)
+        except Exception as e:
+            self.get_logger().error(f"处理WebSocket消息失败: {e}")
+
+    async def _connect_and_listen(self):
+        while self.running:
+            try:
+                self.get_logger().info(f"尝试连接到用户服务器: {self.user_server_url}")
+                async with websockets.connect(self.user_server_url, ping_interval=None) as websocket:
+                    self.websocket = websocket
+                    self.get_logger().info("✅ 成功连接到用户服务器")
+                    async for message in websocket:
+                        await self._handle_websocket_message(message)
+            except Exception as e:
+                self.get_logger().error(f"WebSocket错误: {e}，5秒后重试...")
+                await asyncio.sleep(5)
+
+    def _start_ws_client_loop(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._connect_and_listen())
+
+    def destroy_node(self):
+        self.running = False
+        if self.websocket:
+            asyncio.run_coroutine_threadsafe(self.websocket.close(), asyncio.get_event_loop())
+        super().destroy_node()
+
+
+def start(args=None):
+    rclpy.init(args=args)
+    node = WsClientNode("ws_client_node", user_host=DEST_IP, user_port=8000)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("节点中断")
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    start()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import requests
+import time
+import json
+import threading
+from pynput.keyboard import Listener, Key
+import math # 用于角度转换
+
+# 简化ROBOT_SPORT_API_IDS，只保留需要的
+ROBOT_SPORT_API_IDS = {
+    "DAMP": 1001,
+    "BALANCESTAND": 1002,
+    "STOPMOVE": 1003,
+    "STANDUP": 1004,
+    "SIT": 1005,
+    "MOVE": 1008,
+}
+
+class UnitreeKeyboardClient:
+    def __init__(self, server_host='192.168.86.115', server_port=8000):
+        self.base_url = f"http://{server_host}:{server_port}"
+        self.running = True  # 程序运行标志
+        self.command_lock = threading.Lock() # 用于实现非抢占式执行
+
+        # 指令API ID定义
+        self.API_DAMP = ROBOT_SPORT_API_IDS["DAMP"]
+        self.API_BALANCE = ROBOT_SPORT_API_IDS["BALANCESTAND"]
+        self.API_STOP = ROBOT_SPORT_API_IDS["STOPMOVE"]
+        self.API_STAND = ROBOT_SPORT_API_IDS["STANDUP"]
+        self.API_SIT = ROBOT_SPORT_API_IDS["SIT"]
+        self.API_MOVE = ROBOT_SPORT_API_IDS["MOVE"]
+        
+        print("===== 机器狗键盘控制器 (原子动作模式) =====")
+        print(f"服务端地址: {self.base_url}")
+        print("控制按键:")
+        print("  W: 前进0.25m")
+        print("  A: 左转30度")
+        print("  D: 右转30度")
+        print("  S: 停止0.5秒")
+        print("  ESC: 退出程序")
+        print("===========================")
+
+    def _send_network_request(self, api_id, parameter=None, binary=None):
+        """
+        只负责发送指令到服务端，并等待响应。不管理锁。
+        返回True表示网络请求成功且服务器响应成功，否则返回False。
+        """
+        parameter = parameter or {}
+        binary = binary or []
+        cmd = {
+            "api_id": api_id,
+            "parameter": parameter,
+            "binary": binary
+        }
+        try:
+            response = requests.post(
+                f"{self.base_url}/sport",
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(cmd),
+                timeout=5 # 增加超时时间以等待服务器处理
+            )
+            response_json = response.json()
+            if response.status_code == 200 and response_json.get('status') == 'success':
+                #print(f"指令 [{api_id}] 发布成功: {response_json.get('message')}")
+                return True
+            else:
+                print(f"指令 [{api_id}] 发布失败 ({response.status_code}): {response_json.get('message', response.text)}")
+                return False
+        except requests.exceptions.Timeout:
+            print(f"通信超时: 指令 [{api_id}] 未收到响应。")
+            return False
+        except requests.exceptions.RequestException as e:
+            print(f"通信错误: {str(e)}")
+            return False
+        except json.JSONDecodeError:
+            print(f"服务器返回了无效的JSON: {response.text}")
+            return False
+
+    def _execute_atomic_action_thread(self, action_func):
+        """
+        在单独的线程中执行原子动作函数，并在完成后释放锁。
+        """
+        try:
+            action_func()
+        finally:
+            self.command_lock.release()
+
+    def perform_action_w(self):
+        print("发送: 前进0.25m")
+        if self._send_network_request(self.API_MOVE, parameter={"x": 0.8, "y": 0, "z": 0}):
+            time.sleep(0.5) # 移动持续时间
+            self._send_network_request(self.API_STOP) # 停止移动
+
+    def perform_action_a(self):
+        print("发送: 左转30度")
+        # 保持用户原代码中的2.0，如果机器人API期望的是角速度（rad/s），0.25秒内转动0.5弧度约28.6度
+        if self._send_network_request(self.API_MOVE, parameter={"x": 0, "y": 0, "z": 2.0}):
+            time.sleep(0.25) # 旋转持续时间
+            self._send_network_request(self.API_STOP) # 停止旋转
+
+    def perform_action_d(self):
+        print("发送: 右转30度")
+        # 保持用户原代码中的-2.0
+        if self._send_network_request(self.API_MOVE, parameter={"x": 0, "y": 0, "z": -2.0}):
+            time.sleep(0.25) # 旋转持续时间
+            self._send_network_request(self.API_STOP) # 停止旋转
+
+    def perform_action_s(self):
+        print("发送: 停止0.5秒")
+        if self._send_network_request(self.API_STOP):
+            time.sleep(0.5) # 停止持续时间
+
+    def on_press(self, key):
+        """键盘按下事件处理，执行原子动作。"""
+        if not self.running:
+            return False 
+
+        # ESC键应始终响应，不受锁的影响
+        if key == Key.esc:  
+            self.running = False
+            return False  # 返回False会停止pynput监听器
+
+        # 尝试获取锁，如果无法获取，说明有其他指令正在执行，直接忽略此按键
+        if not self.command_lock.acquire(blocking=False):
+            print(">> 有其他指令正在执行中，此按键已被忽略。")
+            return
+
+        # 成功获取锁后，在一个新线程中执行实际动作
+        try:
+            if hasattr(key, 'char'):
+                key_char = key.char.lower()
+                
+                # 原子动作控制
+                if key_char == 'w':
+                    threading.Thread(target=self._execute_atomic_action_thread, args=(self.perform_action_w,)).start()
+                elif key_char == 'a':
+                    threading.Thread(target=self._execute_atomic_action_thread, args=(self.perform_action_a,)).start()
+                elif key_char == 'd':
+                    threading.Thread(target=self._execute_atomic_action_thread, args=(self.perform_action_d,)).start()
+                elif key_char == 's':
+                    threading.Thread(target=self._execute_atomic_action_thread, args=(self.perform_action_s,)).start()
+                else:
+                    # 如果按下的键不是控制键，但成功获取了锁，需要立即释放
+                    self.command_lock.release()
+            else:
+                # 如果是其他特殊按键（不是ESC），且成功获取了锁，也需要立即释放
+                self.command_lock.release()
+            
+        except AttributeError:
+            # 处理例如按键.char在非字符键上引发AttributeError的情况
+            # 如果此时已获取锁，必须释放
+            self.command_lock.release()
+            pass  
+        # 注意：这里不再有外部的finally块，因为锁的释放现在由新线程的 _execute_atomic_action_thread 负责
+
+    # 原子动作模式下，不需要处理按键释放事件
+    # def on_release(self, key):
+    #     pass
+
+    def start_control(self):
+        """启动控制流程"""
+        print("初始化: 发送站立和平衡站立指令...")
+        # 初始指令，在监听器启动前执行，不会有并发竞争
+        self._send_network_request(self.API_STAND)
+        time.sleep(2) # 给机器人留出站立时间
+        self._send_network_request(self.API_BALANCE)
+        time.sleep(1) # 给机器人留出平衡时间
+        print("初始化完成。等待您的指令...")
+        
+        # 启动键盘监听线程
+        listener = Listener(
+            on_press=self.on_press,
+            on_release=None, # 不再需要on_release
+            daemon=True  # 守护线程，主程序退出时自动结束
+        )
+        listener.start()
+        
+        # 主循环：保持程序运行，等待键盘事件
+        try:
+            while self.running:
+                time.sleep(0.1) # 避免CPU空转
+                
+        except KeyboardInterrupt:
+            pass # 允许通过Ctrl+C退出
+        finally:
+            # 程序退出时发送的指令
+            print("\n程序退出，发送停止、坐下和阻尼指令...")
+            # 这里的退出指令在监听器停止后执行，不会有并发竞争
+            self._send_network_request(self.API_STOP)
+            time.sleep(1)
+            self._send_network_request(self.API_SIT)
+            time.sleep(3)
+            self._send_network_request(self.API_DAMP)
+            print("退出指令发送完成。")
+            listener.stop() # 停止键盘监听
+
+if __name__ == "__main__":
+    client = UnitreeKeyboardClient(server_host='192.168.86.115', server_port=8000)
+    client.start_control()
+
+
+
+
+
+
+
+
+
+
+
+
+
+import http.server
+import socket
+import socketserver
+import json
+import threading
+from urllib.parse import urlparse
+
+import rclpy
+from rclpy.node import Node
+from unitree_api.msg import Request
+from unitree_api.msg import RequestHeader
+from unitree_api.msg import RequestIdentity
+
+def get_local_ip():
+    """获取当前设备的非回环IPv4地址"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            return ip
+    except Exception:
+        interfaces = socket.getaddrinfo(socket.gethostname(), None)
+        for addr in interfaces:
+            ip = addr[4][0]
+            if ip.startswith("127.") or ":" in ip:
+                continue
+            return ip
+    return "0.0.0.0"
+
+class ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+    def __init__(self, server_address, RequestHandlerClass, node):
+        super().__init__(server_address, RequestHandlerClass)
+        self.node = node
+
+class HTTPHandler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        parsed_path = urlparse(self.path)
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length).decode('utf-8')
+        
+        if parsed_path.path == "/sport":
+            try:
+                data = json.loads(post_data)
+                if 'api_id' not in data:
+                    raise ValueError("缺少必要参数: api_id")
+                
+                api_id = data['api_id']
+                parameter = json.dumps(data.get('parameter', {}))
+                binary = data.get('binary', [])
+                
+                self.server.node.publish_request(api_id, parameter, binary)
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'status': 'success',
+                    'message': f'已发布请求，api_id: {api_id}'
+                }).encode('utf-8'))
+                
+            except json.JSONDecodeError:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write('无效的JSON格式'.encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(f"请求处理失败: {str(e)}".encode('utf-8'))
+                
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write('Not Found'.encode('utf-8'))
+
+class HttpServer(Node):
+    def __init__(self, name, host='localhost', port=8000):
+        super().__init__(name)
+        self.http_server = ReusableTCPServer((host, port), HTTPHandler, self)
+        self.get_logger().info(f"服务器已启动，监听 {host}:{port}")
+        
+        self.pub_request = self.create_publisher(
+            Request, 
+            '/api/sport/request', 
+            10
+        )
+        
+        self.http_thread = threading.Thread(
+            target=self.http_serve, 
+            daemon=True
+        )
+        self.http_thread.start()
+
+    def publish_request(self, api_id, parameter, binary):
+        msg = Request()
+        msg.header = RequestHeader()
+        msg.header.identity = RequestIdentity()
+        
+        msg.header.identity.api_id = api_id
+        msg.parameter = parameter
+        msg.binary = [int(x) & 0xFF for x in binary]
+        
+        self.pub_request.publish(msg)
+        self.get_logger().info(f"已发布请求: api_id={api_id}, parameter={parameter}")
+    
+    def http_serve(self):
+        try:
+            self.http_server.serve_forever()
+        except KeyboardInterrupt:
+            self.get_logger().info("HTTP服务器已关闭")
+        finally:
+            self.http_server.server_close()
+
+def start(args=None):
+    rclpy.init(args=args)
+    node = HttpServer("http_server", host=get_local_ip(), port=8000)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("节点已被中断")
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    start()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import cv2
+import pyaudio
+import socket
+import threading
+import numpy as np
+import struct
+
+# 配置参数
+HOST = '127.0.0.1'
+VIDEO_PORT = 5000
+AUDIO_PORT = 5001
+CHUNK = 1024
+FORMAT = pyaudio.paInt16
+CHANNELS = 2  # 双声道
+RATE = 44100
+VIDEO_WIDTH = 640
+VIDEO_HEIGHT = 480
+
+# 初始化网络连接
+video_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+audio_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+def list_available_microphones():
+    """列出所有可用麦克风设备及索引"""
+    p = pyaudio.PyAudio()
+    info = p.get_host_api_info_by_index(0)
+    numdevices = info.get('deviceCount')
+    mics = []
+    for i in range(numdevices):
+        if (p.get_device_info_by_host_api_device_index(0, i).get('maxInputChannels')) > 0:
+            name = p.get_device_info_by_host_api_device_index(0, i).get('name')
+            mics.append((i, name))  # (设备索引, 设备名称)
+    print("可用麦克风:")
+    for idx, name in mics:
+        print(f"  索引 {idx}: {name}")
+    p.terminate()
+    return mics
+
+def list_available_cameras():
+    """列出所有可用摄像头索引及是否可用"""
+    index = 0
+    arr = []
+    while True:
+        cap = cv2.VideoCapture(index)
+        if not cap.read()[0]:
+            break
+        else:
+            arr.append(index)
+        cap.release()
+        index += 1
+    print(f"可用摄像头索引: {arr}（默认0）")
+    return arr
+
+def send_audio(mic_index=None):
+    """发送音频数据"""
+    p = pyaudio.PyAudio()
+    
+    # 打开麦克风流
+    stream = p.open(format=FORMAT,
+                    channels=CHANNELS,
+                    rate=RATE,
+                    input=True,
+                    input_device_index=mic_index,
+                    frames_per_buffer=CHUNK)
+    
+    print("开始发送音频...")
+    
+    try:
+        while True:
+            data = stream.read(CHUNK)
+            # 发送音频数据
+            audio_socket.sendto(data, (HOST, AUDIO_PORT))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
+
+def send_video(camera_index=0):
+    """发送视频数据（去除本地视频显示）"""
+    # 打开摄像头
+    cap = cv2.VideoCapture(camera_index)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, VIDEO_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, VIDEO_HEIGHT)
+    
+    print("开始发送视频...")
+    
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+                
+            # 压缩视频帧
+            ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+            data = buffer.tobytes()
+            
+            # 计算数据大小并分块发送
+            data_len = len(data)
+            # 先发送数据长度
+            video_socket.sendto(struct.pack("Q", data_len), (HOST, VIDEO_PORT))
+            # 发送数据
+            video_socket.sendto(data, (HOST, VIDEO_PORT))
+            
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cap.release()
+
+if __name__ == "__main__":
+    # 列出设备并选择（代码不变）
+    available_mics = list_available_microphones()
+    selected_mic = available_mics[0][0] if available_mics else None
+    available_cams = list_available_cameras()
+    selected_cam = available_cams[0] if available_cams else 0
+
+    # 启动线程时设置为守护线程
+    audio_thread = threading.Thread(target=send_audio, args=(selected_mic,), daemon=True)
+    video_thread = threading.Thread(target=send_video, args=(selected_cam,), daemon=True)
+    
+    audio_thread.start()
+    video_thread.start()
+    
+    try:
+        while True:
+            threading.Event().wait(1)
+    except KeyboardInterrupt:
+        print("\n收到退出信号，正在终止...")
+    finally:
+        video_socket.close()
+        audio_socket.close()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import sounddevice as sd
+import queue
+import http.server
+import socketserver
+import numpy as np
+import sys
+import threading
+
+# 配置参数
+LISTEN_HOST = "0.0.0.0"
+LISTEN_PORT = 8000
+INPUT_DEVICE_ID = 24
+QUEUE_MAXSIZE = 50
+BLOCKSIZE = 2048
+
+audio_queue = queue.Queue(maxsize=QUEUE_MAXSIZE)
+audio_metadata = {
+    "samplerate": None,
+    "channels": None
+}
+
+def input_callback(indata, frames, time, status):
+    if status:
+        print(f"输入状态: {status}", file=sys.stderr)
+    try:
+        audio_queue.put_nowait(indata.copy())
+    except queue.Full:
+        audio_queue.get()
+        audio_queue.put(indata.copy())
+
+class SilentHTTPHandler(http.server.BaseHTTPRequestHandler):
+    """禁用访问日志的HTTP处理器"""
+    def log_message(self, format, *args):
+        """重写日志方法，不输出任何内容"""
+        return
+
+    def do_GET(self):
+        if self.path == "/metadata":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            import json
+            self.wfile.write(json.dumps(audio_metadata).encode())
+        
+        elif self.path == "/audio":
+            try:
+                indata = audio_queue.get(timeout=0.01)
+                audio_bytes = indata.tobytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Frames", str(indata.shape[0]))
+                self.end_headers()
+                self.wfile.write(audio_bytes)
+            except queue.Empty:
+                self.send_response(204)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+class SilentTCPServer(socketserver.TCPServer):
+    """捕获连接异常的服务器，避免报错信息"""
+    def handle_error(self, request, client_address):
+        """重写错误处理，忽略连接重置等常见错误"""
+        import traceback
+        error = traceback.format_exc()
+        # 只忽略"远程主机强迫关闭连接"的错误，其他错误仍输出
+        if "ConnectionResetError" in error or "WinError 10054" in error:
+            return
+        # 其他错误简要输出
+        print(f"服务器错误: {str(error).splitlines()[-1]}")
+
+def start_http_server():
+    server_address = (LISTEN_HOST, LISTEN_PORT)
+    SilentTCPServer.allow_reuse_address = True
+    httpd = SilentTCPServer(server_address, SilentHTTPHandler)
+    print(f"服务器启动，监听 {LISTEN_HOST}:{LISTEN_PORT}")
+    print("提供接口: /metadata (元数据), /audio (音频数据)")
+    print("按Ctrl+C停止")
+    httpd.serve_forever()
+
+def main():
+    if INPUT_DEVICE_ID is None:
+        input_info = sd.query_devices(None, 'input')
+        print(f"使用默认输入设备: {input_info['name']}")
+    else:
+        try:
+            input_info = sd.query_devices(INPUT_DEVICE_ID, 'input')
+            print(f"使用输入设备: {input_info['name']} (ID: {INPUT_DEVICE_ID})")
+        except Exception as e:
+            print(f"输入设备错误: {e}")
+            return
+    
+    global audio_metadata
+    audio_metadata["samplerate"] = int(input_info["default_samplerate"])
+    audio_metadata["channels"] = input_info["max_input_channels"]
+    print(f"音频参数: 采样率 {audio_metadata['samplerate']} Hz, 声道数 {audio_metadata['channels']}")
+    
+    server_thread = threading.Thread(target=start_http_server, daemon=True)
+    server_thread.start()
+    
+    try:
+        with sd.InputStream(
+            device=INPUT_DEVICE_ID,
+            samplerate=audio_metadata["samplerate"],
+            channels=audio_metadata["channels"],
+            blocksize=0,
+            callback=input_callback
+        ):
+            while True:
+                sys.stdin.read(1)
+    except KeyboardInterrupt:
+        print("\n服务器已停止")
+    except Exception as e:
+        print(f"输入流错误: {e}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+import sounddevice as sd
+import queue
+import requests
+import numpy as np
+import sys
+import time
+import json
+import threading
+
+# 配置参数
+SERVER_HOST = "192.168.86.115"
+SERVER_PORT = 8000
+OUTPUT_DEVICE_ID = None
+QUEUE_MAXSIZE = 50
+FETCH_INTERVAL = 0.01
+# 取消严格blocksize限制，改为动态适配（关键）
+
+audio_queue = queue.Queue(maxsize=QUEUE_MAXSIZE)
+audio_metadata = None
+fetch_running = True
+
+def fetch_metadata():
+    url = f"http://{SERVER_HOST}:{SERVER_PORT}/metadata"
+    try:
+        response = requests.get(url, timeout=2)
+        return json.loads(response.text) if response.status_code == 200 else None
+    except:
+        return None
+
+def fetch_audio_worker():
+    global fetch_running
+    url = f"http://{SERVER_HOST}:{SERVER_PORT}/audio"
+    while fetch_running:
+        try:
+            response = requests.get(url, timeout=0.5)
+            if response.status_code == 200:
+                frames = int(response.headers["Frames"])
+                channels = audio_metadata["channels"]
+                audio_bytes = response.content
+                indata = np.frombuffer(audio_bytes, dtype=np.float32).reshape(frames, channels)
+                try:
+                    audio_queue.put_nowait(indata)
+                except queue.Full:
+                    audio_queue.get()
+                    audio_queue.put(indata)
+            elif response.status_code == 204:
+                time.sleep(FETCH_INTERVAL)
+            else:
+                time.sleep(0.1)
+        except Exception as e:
+            if fetch_running:
+                print(f"网络错误: {str(e)[:50]}", end="\r")
+            time.sleep(0.5)
+
+def output_callback(outdata, frames, time, status):
+    """核心修复：完全根据输出所需帧数量动态调整数据"""
+    if status:
+        print(f"输出状态: {status}", file=sys.stderr)
+    
+    # 输出缓冲区的形状（frames是当前需要的帧数量）
+    out_shape = (frames, outdata.shape[1])
+    # 初始化一个空数组用于拼接数据
+    combined = np.array([], dtype=np.float32).reshape(0, outdata.shape[1])
+    
+    try:
+        # 循环从队列取数据，直到凑够所需的帧数量
+        while combined.shape[0] < frames:
+            indata = audio_queue.get(timeout=0.1)
+            # 适配声道数（截断或填充到输出声道数）
+            in_channels = indata.shape[1]
+            out_channels = outdata.shape[1]
+            if in_channels > out_channels:
+                indata = indata[:, :out_channels]  # 输入声道多，截断
+            elif in_channels < out_channels:
+                # 输入声道少，补0到输出声道数
+                padding = np.zeros((indata.shape[0], out_channels - in_channels), dtype=np.float32)
+                indata = np.concatenate([indata, padding], axis=1)
+            
+            # 拼接数据
+            remaining = frames - combined.shape[0]  # 还需要的帧数
+            if indata.shape[0] <= remaining:
+                combined = np.concatenate([combined, indata], axis=0)
+            else:
+                # 数据足够，取需要的部分，剩余的放回队列
+                combined = np.concatenate([combined, indata[:remaining, :]], axis=0)
+                audio_queue.put(indata[remaining:, :])  # 剩余部分放回队列
+                break
+        
+        # 确保最终数据形状与输出完全一致
+        outdata[:] = combined[:frames, :]
+        
+    except queue.Empty:
+        # 队列空，用静音填充
+        outdata.fill(0)
+        print(f"警告：数据不足，需{frames}帧，仅凑够{combined.shape[0]}帧", end="\r")
+
+def main():
+    global audio_metadata, fetch_running
+    print("连接服务器并获取音频参数...")
+    while audio_metadata is None:
+        audio_metadata = fetch_metadata()
+        if audio_metadata is None:
+            time.sleep(1)
+    
+    print(f"服务器音频参数: 采样率 {audio_metadata['samplerate']} Hz, 声道数 {audio_metadata['channels']}")
+    
+    if OUTPUT_DEVICE_ID is None:
+        output_info = sd.query_devices(None, 'output')
+        print(f"使用默认输出设备: {output_info['name']}")
+    else:
+        try:
+            output_info = sd.query_devices(OUTPUT_DEVICE_ID, 'output')
+            print(f"使用输出设备: {output_info['name']} (ID: {OUTPUT_DEVICE_ID})")
+        except Exception as e:
+            print(f"输出设备错误: {e}")
+            return
+    
+    fetch_thread = threading.Thread(target=fetch_audio_worker, daemon=True)
+    fetch_thread.start()
+    
+    try:
+        # 不强制blocksize，让设备自动选择（避免驱动调整导致的不匹配）
+        with sd.OutputStream(
+            device=OUTPUT_DEVICE_ID,
+            samplerate=audio_metadata["samplerate"],
+            channels=audio_metadata["channels"],
+            # 移除blocksize参数，或设置为0（自动）
+            callback=output_callback
+        ):
+            print("开始播放音频...（按Ctrl+C停止）")
+            while True:
+                sys.stdin.read(1)
+    except KeyboardInterrupt:
+        fetch_running = False
+        fetch_thread.join(timeout=1)
+        print("\n客户端已停止")
+    except Exception as e:
+        print(f"输出流错误: {e}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+import sounddevice as sd
+import queue
+import http.server
+import socketserver
+import numpy as np
+import sys
+import threading
+
+# 配置参数
+LISTEN_HOST = "0.0.0.0"
+LISTEN_PORT = 8000
+INPUT_DEVICE_ID = None
+QUEUE_MAXSIZE = 50
+BLOCKSIZE = 1024
+
+audio_queue = queue.Queue(maxsize=QUEUE_MAXSIZE)
+audio_metadata = {
+    "samplerate": None,
+    "channels": None
+}
+
+def input_callback(indata, frames, time, status):
+    if status:
+        print(f"输入状态: {status}", file=sys.stderr)
+    try:
+        audio_queue.put_nowait(indata.copy())
+    except queue.Full:
+        audio_queue.get()
+        audio_queue.put(indata.copy())
+
+class SilentHTTPHandler(http.server.BaseHTTPRequestHandler):
+    """禁用访问日志的HTTP处理器"""
+    def log_message(self, format, *args):
+        """重写日志方法，不输出任何内容"""
+        return
+
+    def do_GET(self):
+        if self.path == "/metadata":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            import json
+            self.wfile.write(json.dumps(audio_metadata).encode())
+        
+        elif self.path == "/audio":
+            try:
+                indata = audio_queue.get(timeout=0.1)
+                audio_bytes = indata.tobytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Frames", str(indata.shape[0]))
+                self.end_headers()
+                self.wfile.write(audio_bytes)
+            except queue.Empty:
+                self.send_response(204)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+class SilentTCPServer(socketserver.TCPServer):
+    """捕获连接异常的服务器，避免报错信息"""
+    def handle_error(self, request, client_address):
+        """重写错误处理，忽略连接重置等常见错误"""
+        import traceback
+        error = traceback.format_exc()
+        # 只忽略"远程主机强迫关闭连接"的错误，其他错误仍输出
+        if "ConnectionResetError" in error or "WinError 10054" in error:
+            return
+        # 其他错误简要输出
+        print(f"服务器错误: {str(error).splitlines()[-1]}")
+
+def start_http_server():
+    server_address = (LISTEN_HOST, LISTEN_PORT)
+    SilentTCPServer.allow_reuse_address = True
+    httpd = SilentTCPServer(server_address, SilentHTTPHandler)
+    print(f"服务器启动，监听 {LISTEN_HOST}:{LISTEN_PORT}")
+    print("提供接口: /metadata (元数据), /audio (音频数据)")
+    print("按Ctrl+C停止")
+    httpd.serve_forever()
+
+def main():
+    if INPUT_DEVICE_ID is None:
+        input_info = sd.query_devices(None, 'input')
+        print(f"使用默认输入设备: {input_info['name']}")
+    else:
+        try:
+            input_info = sd.query_devices(INPUT_DEVICE_ID, 'input')
+            print(f"使用输入设备: {input_info['name']} (ID: {INPUT_DEVICE_ID})")
+        except Exception as e:
+            print(f"输入设备错误: {e}")
+            return
+    
+    global audio_metadata
+    audio_metadata["samplerate"] = int(input_info["default_samplerate"])
+    audio_metadata["channels"] = input_info["max_input_channels"]
+    print(f"音频参数: 采样率 {audio_metadata['samplerate']} Hz, 声道数 {audio_metadata['channels']}")
+    
+    server_thread = threading.Thread(target=start_http_server, daemon=True)
+    server_thread.start()
+    
+    try:
+        with sd.InputStream(
+            device=INPUT_DEVICE_ID,
+            samplerate=audio_metadata["samplerate"],
+            channels=audio_metadata["channels"],
+            blocksize=BLOCKSIZE,
+            callback=input_callback
+        ):
+            while True:
+                sys.stdin.read(1)
+    except KeyboardInterrupt:
+        print("\n服务器已停止")
+    except Exception as e:
+        print(f"输入流错误: {e}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import sounddevice as sd
+import queue
+import sys
+
+# 全局队列用于传递输入到输出的音频数据
+audio_queue = queue.Queue(maxsize=10)  # 缓冲区大小，避免数据溢出
+
+def input_callback(indata, frames, time, status):
+    """输入回调：将音频数据存入队列"""
+    if status:
+        print(f"输入状态: {status}", file=sys.stderr)
+    try:
+        # 非阻塞方式放入队列，避免输入过快导致阻塞
+        audio_queue.put_nowait(indata.copy())
+    except queue.Full:
+        # 队列满时丢弃 oldest 数据（避免崩溃）
+        audio_queue.get()
+        audio_queue.put(indata.copy())
+
+def output_callback(outdata, frames, time, status):
+    """输出回调：从队列取数据播放"""
+    if status:
+        print(f"输出状态: {status}", file=sys.stderr)
+    try:
+        # 从队列取数据，超时则填静音
+        indata = audio_queue.get(timeout=0.1)
+        # 适配输出声道数
+        min_ch = min(indata.shape[1], outdata.shape[1])
+        outdata[:, :min_ch] = indata[:, :min_ch]
+        if outdata.shape[1] > min_ch:
+            outdata[:, min_ch:] = 0
+    except queue.Empty:
+        # 队列空时输出静音
+        outdata.fill(0)
+        print("警告：输入数据不足，输出静音", file=sys.stderr)
+
+def main():
+    input_id = 1
+    input_id = int(input_id) if input_id else sd.default.device[0]
+    input_info = sd.query_devices(input_id, 'input')
+
+    output_id = 5
+    output_id = int(output_id) if output_id else sd.default.device[1]
+    output_info = sd.query_devices(output_id, 'output')
+
+    # 统一采样率（以输入设备为准，输出自动适配）
+    samplerate = int(input_info['default_samplerate'])
+    input_ch = input_info['max_input_channels']
+    output_ch = output_info['max_output_channels']
+
+    with sd.InputStream(
+        device=input_id,
+        samplerate=samplerate,
+        channels=input_ch,
+        callback=input_callback
+    ), sd.OutputStream(
+        device=output_id,
+        samplerate=samplerate,
+        channels=output_ch,
+        callback=output_callback
+    ):
+        # 保持程序运行
+        while True:
+            sys.stdin.read(1)
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+import sounddevice as sd
+import queue
+import sys
+
+# 全局队列用于传递输入到输出的音频数据
+audio_queue = queue.Queue(maxsize=10)  # 缓冲区大小，避免数据溢出
+
+def list_input_devices():
+    """列出所有可用输入设备"""
+    devices = sd.query_devices()
+    input_devices = []
+    print("===== 可用输入设备 =====")
+    for i, dev in enumerate(devices):
+        if dev['max_input_channels'] > 0:
+            input_devices.append((i, dev))
+            print(f"ID {i}: {dev['name']}")
+            print(f"  最大输入声道: {dev['max_input_channels']} | 采样率: {int(dev['default_samplerate'])} Hz\n")
+    return input_devices
+
+def list_output_devices():
+    """列出所有可用输出设备"""
+    devices = sd.query_devices()
+    output_devices = []
+    print("\n===== 可用输出设备 =====")
+    for i, dev in enumerate(devices):
+        if dev['max_output_channels'] > 0:
+            output_devices.append((i, dev))
+            print(f"ID {i}: {dev['name']}")
+            print(f"  最大输出声道: {dev['max_output_channels']} | 采样率: {int(dev['default_samplerate'])} Hz\n")
+    return output_devices
+
+def input_callback(indata, frames, time, status):
+    """输入回调：将音频数据存入队列"""
+    if status:
+        print(f"输入状态: {status}", file=sys.stderr)
+    try:
+        # 非阻塞方式放入队列，避免输入过快导致阻塞
+        audio_queue.put_nowait(indata.copy())
+    except queue.Full:
+        # 队列满时丢弃 oldest 数据（避免崩溃）
+        audio_queue.get()
+        audio_queue.put(indata.copy())
+
+def output_callback(outdata, frames, time, status):
+    """输出回调：从队列取数据播放"""
+    if status:
+        print(f"输出状态: {status}", file=sys.stderr)
+    try:
+        # 从队列取数据，超时则填静音
+        indata = audio_queue.get(timeout=0.1)
+        # 适配输出声道数
+        min_ch = min(indata.shape[1], outdata.shape[1])
+        outdata[:, :min_ch] = indata[:, :min_ch]
+        if outdata.shape[1] > min_ch:
+            outdata[:, min_ch:] = 0
+    except queue.Empty:
+        # 队列空时输出静音
+        outdata.fill(0)
+        print("警告：输入数据不足，输出静音", file=sys.stderr)
+
+def main():
+    # 选择输入设备
+    input_devices = list_input_devices()
+    if not input_devices:
+        print("未找到输入设备，退出")
+        return
+    try:
+        input_id = input("请输入输入设备ID（回车用默认）: ").strip()
+        input_id = int(input_id) if input_id else sd.default.device[0]
+        print(input_id)
+        print(input_id)
+        print(input_id)
+        input_info = sd.query_devices(input_id, 'input')
+        if input_info['max_input_channels'] == 0:
+            raise ValueError("所选设备不支持输入")
+    except (ValueError, IndexError):
+        print("无效输入设备ID")
+        return
+
+    # 选择输出设备
+    output_devices = list_output_devices()
+    if not output_devices:
+        print("未找到输出设备，退出")
+        return
+    try:
+        output_id = input("请输入输出设备ID（回车用默认）: ").strip()
+        output_id = int(output_id) if output_id else sd.default.device[1]
+        print(output_id)
+        print(output_id)
+        print(output_id)
+        output_info = sd.query_devices(output_id, 'output')
+        if output_info['max_output_channels'] == 0:
+            raise ValueError("所选设备不支持输出")
+    except (ValueError, IndexError):
+        print("无效输出设备ID")
+        return
+
+    # 统一采样率（以输入设备为准，输出自动适配）
+    samplerate = int(input_info['default_samplerate'])
+    input_ch = input_info['max_input_channels']
+    output_ch = output_info['max_output_channels']
+
+    print("\n===== 设备信息 =====")
+    print(f"输入设备: {input_info['name']} (声道: {input_ch})")
+    print(f"输出设备: {output_info['name']} (声道: {output_ch})")
+    print(f"采样率: {samplerate} Hz")
+    print("开始运行（按Ctrl+C停止）...")
+
+    # 分别创建输入流和输出流（完全分离）
+    try:
+        with sd.InputStream(
+            device=input_id,
+            samplerate=samplerate,
+            channels=input_ch,
+            callback=input_callback
+        ), sd.OutputStream(
+            device=output_id,
+            samplerate=samplerate,
+            channels=output_ch,
+            callback=output_callback
+        ):
+            # 保持程序运行
+            while True:
+                sys.stdin.read(1)
+    except KeyboardInterrupt:
+        print("\n用户停止，程序退出")
+    except Exception as e:
+        print(f"\n错误: {e}")
+        print("排查建议：检查设备占用/权限，或尝试默认设备")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import requests
+import time
+import json
+import base64
+import numpy as np
+from pynput.keyboard import Listener, Key
+import matplotlib.pyplot as plt
+import threading
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import tkinter as tk
+
+# 确保Matplotlib使用Tkinter后端（主线程安全）
+plt.switch_backend('TkAgg')
+
+def show_pointcloud(json_str):
+    """修正后的点云可视化函数"""
+    try:
+        data = json.loads(json_str)
+        binary_data = base64.b64decode(data["_data"])
+        num_points = data["_width"] * data["_height"]
+        fields = {f["_name"]: (f["_offset"], f["_datatype"]) for f in data["_fields"]}
+        dtype_map = {7: np.float32, 2: np.uint8, 8: np.uint64}
+        
+        # 直接使用NumPy数组存储点云数据（修复列表索引问题）
+        points = np.empty((num_points, 3), dtype=np.float32)
+        
+        for i in range(num_points):
+            point_offset = i * data["_point_step"]
+            # 提取x坐标
+            x = np.frombuffer(
+                binary_data, 
+                dtype=dtype_map[fields["x"][1]],
+                count=1, 
+                offset=point_offset + fields["x"][0]
+            )[0]
+            # 提取y坐标
+            y = np.frombuffer(
+                binary_data, 
+                dtype=dtype_map[fields["y"][1]],
+                count=1, 
+                offset=point_offset + fields["y"][0]
+            )[0]
+            # 提取z坐标
+            z = np.frombuffer(
+                binary_data, 
+                dtype=dtype_map[fields["z"][1]],
+                count=1, 
+                offset=point_offset + fields["z"][0]
+            )[0]
+            points[i] = [x, y, z]
+
+        # 在主线程中创建可视化窗口（修复线程问题）
+        def plot_in_main_thread():
+            root = tk.Tk()
+            root.title("点云可视化")
+            
+            fig = plt.figure(figsize=(10, 10))
+            ax = fig.add_subplot(111, projection='3d')
+            ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=1, alpha=0.6)
+            ax.set_xlabel('X')
+            ax.set_ylabel('Y')
+            ax.set_zlabel('Z')
+            plt.title('PointCloud Visualization')
+            
+            # 将Matplotlib图表嵌入Tkinter窗口
+            canvas = FigureCanvasTkAgg(fig, master=root)
+            canvas.draw()
+            canvas.get_tk_widget().pack()
+            
+            # 添加关闭按钮
+            btn_close = tk.Button(root, text="关闭", command=root.destroy)
+            btn_close.pack()
+            
+            root.mainloop()
+
+        # 如果当前在子线程，切换到主线程执行
+        if threading.current_thread().name != 'MainThread':
+            # 使用Tkinter主线程调度
+            plot_in_main_thread()
+        else:
+            # 已在主线程，直接绘图
+            plot_in_main_thread()
+            
+    except Exception as e:
+        print(f"可视化错误: {str(e)}")
+
+
+ROBOT_SPORT_API_IDS = {
+    "DAMP": 1001,  # 阻尼控制
+    "BALANCESTAND": 1002,  # 平衡站立
+    "STOPMOVE": 1003,  # 停止运动
+    "STANDUP": 1004,  # 站立
+    "STANDDOWN": 1005,  # 站立下降
+    "RECOVERYSTAND": 1006,  # 恢复站立
+    "EULER": 1007,  # 欧拉角控制
+    "MOVE": 1008,  # 移动
+    "SIT": 1009,  # 坐下
+    "RISESIT": 1010,  # 从坐下恢复站立
+    "SWITCHGAIT": 1011,  # 切换步态
+    "TRIGGER": 1012,  # 触发
+    "BODYHEIGHT": 1013,  # 身体高度调整
+    "FOOTRAISEHEIGHT": 1014,  # 脚部抬起高度调整
+    "SPEEDLEVEL": 1015,  # 速度级别调整
+    "HELLO": 1016,  # 打招呼
+    "STRETCH": 1017,  # 伸展
+    "TRAJECTORYFOLLOW": 1018,  # 轨迹跟随
+    "CONTINUOUSGAIT": 1019,  # 连续步态
+    "CONTENT": 1020,  # 内容
+    "WALLOW": 1021,  # 打滚
+    "DANCE1": 1022,  # 舞蹈1
+    "DANCE2": 1023,  # 舞蹈2
+    "GETBODYHEIGHT": 1024,  # 获取身体高度
+    "GETFOOTRAISEHEIGHT": 1025,  # 获取脚部抬起高度
+    "GETSPEEDLEVEL": 1026,  # 获取速度级别
+    "SWITCHJOYSTICK": 1027,  # 切换操纵杆
+    "POSE": 1028,  # 姿态
+    "SCRAPE": 1029,  # 刮擦
+    "FRONTFLIP": 1030,  # 前空翻
+    "FRONTJUMP": 1031,  # 前跳
+    "FRONTPOUNCE": 1032  # 前扑
+}
+
+class UnitreeKeyboardClient:
+    def __init__(self, server_host='192.168.86.110', server_port=8000):
+        self.base_url = f"http://{server_host}:{server_port}"
+        self.running = True  # 程序运行标志
+        
+        # 运动参数（x:前后, y:左右, z:旋转）
+        self.x = 0.0
+        self.y = 0.0
+        self.z = 0.0
+        self.speed = 0.6  # 运动速度系数（可调整灵敏度）
+
+        self.state_data = None
+        self.lidar_data = None
+        self.image_data = None
+        
+        # 指令API ID定义
+        self.API_DAMP = 1001
+        self.API_BALANCE = 1002
+        self.API_STOP = 1003
+        self.API_STAND = 1004
+        self.API_SIT = 1005
+        self.API_MOVE = 1008
+        
+        print("===== 机器狗键盘控制器 =====")
+        print(f"服务端地址: {self.base_url}")
+        print("控制按键:")
+        print("  W: 前进   S: 后退")
+        print("  A: 左移   D: 右移")
+        print("  Q: 左转   E: 右转")
+        print("  B: 平衡站立  K: 坐下")
+        print("  ENTER: 停止运动")
+        print("  R: 查看雷达点云")
+        print("  ESC: 退出程序")
+        print("===========================")
+
+    def send_command(self, api_id, parameter=None, binary=None):
+        """发送指令到服务端"""
+        parameter = parameter or {}
+        binary = binary or []
+        cmd = {
+            "api_id": api_id,
+            "parameter": parameter,
+            "binary": binary
+        }
+        try:
+            response = requests.post(
+                f"{self.base_url}/sport",
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(cmd),
+                timeout=2
+            )
+            if response.status_code != 200:
+                print(f"指令发送失败: {response.text}")
+        except Exception as e:
+            print(f"通信错误: {str(e)}")
+    
+    def send_request(self, name):
+        """请求雷达数据"""
+        try:
+            response = requests.get(
+                f"{self.base_url}/{name}",
+                timeout=5
+            )
+            if response.status_code == 200:
+                self.lidar_data = response.text
+            else:
+                print(f"指令发送失败: {response.text}")
+                self.lidar_data = None
+        except Exception as e:
+            print(f"通信错误: {str(e)}")
+            self.lidar_data = None
+
+    def on_press(self, key):
+        """键盘按下事件处理"""
+        try:
+            if key == Key.esc:  # 退出程序
+                self.running = False
+                return False  # 停止监听
+            
+            key_char = key.char.lower()
+            
+            # 方向控制
+            if key_char == 'w':
+                self.x = self.speed
+            elif key_char == 's':
+                self.x = -self.speed
+            elif key_char == 'a':
+                self.y = self.speed
+            elif key_char == 'd':
+                self.y = -self.speed
+            elif key_char == 'q':
+                self.z = self.speed * 2  # 旋转速度稍快
+            elif key_char == 'e':
+                self.z = -self.speed * 2
+            
+            # 动作控制
+            elif key_char == 'b':
+                print("发送: 平衡站立")
+                self.send_command(self.API_BALANCE)
+            elif key_char == 'k':
+                print("发送: 坐下")
+                self.send_command(self.API_SIT)
+            elif key == Key.enter:
+                print("发送: 停止运动")
+                self.send_command(self.API_STOP)
+            elif key_char == 'r':
+                print("请求：雷达数据")
+                self.send_request("lidar")
+                if self.lidar_data is None:
+                    print("请求超时或失败")
+                else:
+                    # 启动新线程处理可视化（避免阻塞控制线程）
+                    threading.Thread(
+                        target=show_pointcloud,
+                        args=(self.lidar_data,),
+                        daemon=True
+                    ).start()
+                
+        except AttributeError:
+            pass  # 忽略特殊按键（如Shift、Ctrl等）
+
+    def on_release(self, key):
+        """键盘释放事件处理"""
+        try:
+            key_char = key.char.lower()
+            
+            # 释放方向键时重置对应轴参数
+            if key_char in ['w', 's']:
+                self.x = 0.0
+            elif key_char in ['a', 'd']:
+                self.y = 0.0
+            elif key_char in ['q', 'e']:
+                self.z = 0.0
+        except AttributeError:
+            pass
+
+    def start_control(self):
+        """启动控制流程"""
+        # 初始发送站立指令
+        self.send_command(self.API_STAND)
+        time.sleep(2)
+        self.send_command(self.API_BALANCE)
+        print("初始化: 发送站立和平衡站立指令")
+        time.sleep(1)
+        
+        # 启动键盘监听线程
+        listener = Listener(
+            on_press=self.on_press,
+            on_release=self.on_release,
+            daemon=True  # 守护线程，主程序退出时自动结束
+        )
+        listener.start()
+        
+        # 主循环：持续发送运动指令
+        try:
+            while self.running:
+                # 只有当有运动指令时才发送（节省带宽）
+                if self.x != 0 or self.y != 0 or self.z != 0:
+                    self.send_command(
+                        self.API_MOVE,
+                        parameter={"x": self.x, "y": self.y, "z": self.z},
+                        binary=[127]
+                    )
+                else:
+                    self.send_command(self.API_STOP)
+                time.sleep(0.1)  # 控制指令发送频率（10Hz）
+                
+        except KeyboardInterrupt:
+            pass
+        finally:
+            # 程序退出时发送停止和坐下指令
+            self.send_command(self.API_STOP)
+            self.send_command(self.API_SIT)
+            time.sleep(3)
+            self.send_command(self.API_DAMP)
+            print("\n程序退出，已发送停止和坐下指令")
+
+if __name__ == "__main__":
+    client = UnitreeKeyboardClient(server_host='192.168.86.115', server_port=8000)
+    client.start_control()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import http.server
+import socket
+import socketserver
+import time
+import json
+import base64
+import threading
+import array
+import numpy as np
+from urllib.parse import urlparse, parse_qs
+
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import PointCloud2, PointField  # 导入LIDAR相关消息类型
+
+from unitree_go.msg import SportModeState
+from unitree_api.msg import Request
+from unitree_api.msg import RequestHeader
+from unitree_api.msg import RequestIdentity
+
+def get_local_ip():
+    """获取当前设备的非回环IPv4地址"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            return ip
+    except Exception:
+        interfaces = socket.getaddrinfo(socket.gethostname(), None)
+        for addr in interfaces:
+            ip = addr[4][0]
+            if ip.startswith("127.") or ":" in ip:
+                continue
+            return ip
+    return "0.0.0.0"
+
+def rosmsg_to_dict(msg):
+    """增强版ROS消息转字典，对LIDAR二进制数据进行Base64编码"""
+    # 处理ndarray类型
+    if isinstance(msg, np.ndarray):
+        return msg.tolist()
+    
+    # 处理基本类型
+    if not hasattr(msg, '__slots__'):
+        if isinstance(msg, (list, tuple)):
+            return [rosmsg_to_dict(v) for v in msg]
+        return msg
+    
+    result = {}
+    for slot in msg.__slots__:
+        value = getattr(msg, slot)
+        # 对PointCloud2的data字段进行Base64编码
+        if isinstance(value, array.array):
+            result[slot] = base64.b64encode(value.tobytes()).decode('utf-8')
+        # 处理ndarray类型
+        elif isinstance(value, np.ndarray):
+            result[slot] = value.tolist()
+        # 处理列表和元组
+        elif isinstance(value, (list, tuple)):
+            result[slot] = [rosmsg_to_dict(v) for v in value]
+        else:
+            result[slot] = rosmsg_to_dict(value)
+    
+    return result
+
+class ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+    def __init__(self, server_address, RequestHandlerClass, node):
+        super().__init__(server_address, RequestHandlerClass)
+        self.node = node
+
+class HTTPHandler(http.server.BaseHTTPRequestHandler):
+    hello_str = "hello"
+    state = None
+    lidar = None  # 存储LIDAR数据
+    
+    def do_GET(self):
+        parsed_path = urlparse(self.path)
+        if parsed_path.path == "/":
+            help_text = (
+                "欢迎使用轻量级HTTP服务器！\n"
+                "可用接口：\n"
+                "/hello - 简单问候接口\n"
+                "/time - 获取当前时间戳\n"
+                "/state - 获取机器人运动状态(JSON格式)\n"
+                "/lidar - 获取LIDAR点云数据(JSON格式)\n"  # 新增LIDAR接口说明
+            )
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(help_text.encode('utf-8'))
+        
+        elif parsed_path.path == "/hello":
+            query = parse_qs(parsed_path.query)
+            param = query.get('param', [None])[0]
+            response = "hello"
+            if param == "1":
+                response = self.hello_str
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(response.encode('utf-8'))
+        
+        elif parsed_path.path == "/time":
+            now = time.time()
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(str(now).encode('utf-8'))
+        
+        elif parsed_path.path == "/state":
+            try:
+                state = HTTPHandler.state
+                if state is None:
+                    self.send_response(202)
+                    self.send_header('Content-type', 'text/plain; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write('正在等待运动状态消息，请稍后再试'.encode('utf-8'))
+                    return
+                state_dict = rosmsg_to_dict(state)
+                state_json = json.dumps(state_dict, ensure_ascii=False, indent=2)
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(state_json.encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-type', 'text/plain; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(f"状态获取失败: {e}".encode('utf-8'))
+        
+        # 新增：处理LIDAR数据请求
+        elif parsed_path.path == "/lidar":
+            try:
+                lidar_data = HTTPHandler.lidar
+                if lidar_data is None:
+                    self.send_response(202)
+                    self.send_header('Content-type', 'text/plain; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write('正在等待LIDAR点云数据，请稍后再试'.encode('utf-8'))
+                    return
+                
+                # 转换LIDAR数据为字典并序列化
+                lidar_dict = rosmsg_to_dict(lidar_data)
+                lidar_json = json.dumps(lidar_dict, ensure_ascii=False, indent=2)
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(lidar_json.encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-type', 'text/plain; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(f"LIDAR数据获取失败: {e}".encode('utf-8'))
+        
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b'Not Found')
+
+    def do_POST(self):
+        parsed_path = urlparse(self.path)
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length).decode('utf-8')
+        
+        if parsed_path.path == "/hello":
+            HTTPHandler.hello_str = post_data
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(b'Success')
+            
+        elif parsed_path.path == "/sport":
+            try:
+                data = json.loads(post_data)
+                if 'api_id' not in data:
+                    raise ValueError("缺少必要参数: api_id")
+                
+                api_id = data['api_id']
+                parameter = json.dumps(data.get('parameter', {}))
+                binary = data.get('binary', [])
+                
+                self.server.node.publish_request(api_id, parameter, binary)
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'status': 'success',
+                    'message': f'已发布请求，api_id: {api_id}'
+                }).encode('utf-8'))
+                
+            except json.JSONDecodeError:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write('无效的JSON格式'.encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(f"请求处理失败: {str(e)}".encode('utf-8'))
+                
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write('Not Found'.encode('utf-8'))
+
+
+class HttpServer(Node):
+    def __init__(self, name, host='localhost', port=8000):
+        super().__init__(name)
+        self.http_server = ReusableTCPServer((host, port), HTTPHandler, self)
+        self.get_logger().info(f"服务器已启动，监听 {host}:{port}")
+
+        # 运动状态订阅
+        self.sub_state = self.create_subscription(
+            SportModeState,
+            "/sportmodestate",
+            self.state_callback,
+            10
+        )
+        
+        # 新增：LIDAR点云订阅
+        self.sub_lidar = self.create_subscription(
+            PointCloud2,
+            "/livox/lidar",
+            self.lidar_callback,  # 回调函数
+            10  # QoS设置（点云数据量大，可根据需要调整）
+        )
+        
+        self.pub_request = self.create_publisher(
+            Request, 
+            '/api/sport/request', 
+            10
+        )
+        
+        self.http_thread = threading.Thread(
+            target=self.http_serve, 
+            daemon=True
+        )
+        self.http_thread.start()
+
+    def state_callback(self, msg):
+        HTTPHandler.state = msg
+    
+    def lidar_callback(self, msg):
+        """接收LIDAR点云数据并存储"""
+        HTTPHandler.lidar = msg
+    
+    def publish_request(self, api_id, parameter, binary):
+        msg = Request()
+        msg.header = RequestHeader()
+        msg.header.identity = RequestIdentity()
+        
+        msg.header.identity.api_id = api_id
+        msg.parameter = parameter
+        msg.binary = [int(x) & 0xFF for x in binary]
+        
+        self.pub_request.publish(msg)
+        self.get_logger().info(f"已发布请求: api_id={api_id}, parameter={parameter}")
+    
+    def http_serve(self):
+        try:
+            self.http_server.serve_forever()
+        except KeyboardInterrupt:
+            self.get_logger().info("HTTP服务器已关闭")
+        finally:
+            self.http_server.server_close()
+
+
+def start(args=None):
+    rclpy.init(args=args)
+    node = HttpServer("http_server", host=get_local_ip(), port=8000)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("节点已被中断")
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    start()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+######################^^^2025.10.10^^^###########################
+
+
+
+
+import http.server
+import socket
+import socketserver
+import time
+import json
+import base64
+import threading
+import array
+import numpy as np
+from urllib.parse import urlparse, parse_qs
+
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import PointCloud2, PointField  # 导入LIDAR相关消息类型
+
+from unitree_go.msg import SportModeState
+from unitree_api.msg import Request
+from unitree_api.msg import RequestHeader
+from unitree_api.msg import RequestIdentity
+
+def get_local_ip():
+    """获取当前设备的非回环IPv4地址"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            return ip
+    except Exception:
+        interfaces = socket.getaddrinfo(socket.gethostname(), None)
+        for addr in interfaces:
+            ip = addr[4][0]
+            if ip.startswith("127.") or ":" in ip:
+                continue
+            return ip
+    return "0.0.0.0"
+
+def rosmsg_to_dict(msg):
+    """增强版ROS消息转字典，对LIDAR二进制数据进行Base64编码"""
+    # 处理ndarray类型
+    if isinstance(msg, np.ndarray):
+        return msg.tolist()
+    
+    # 处理基本类型
+    if not hasattr(msg, '__slots__'):
+        if isinstance(msg, (list, tuple)):
+            return [rosmsg_to_dict(v) for v in msg]
+        return msg
+    
+    result = {}
+    for slot in msg.__slots__:
+        value = getattr(msg, slot)
+        # 对PointCloud2的data字段进行Base64编码
+        if isinstance(value, array.array):
+            result[slot] = base64.b64encode(value.tobytes()).decode('utf-8')
+        # 处理ndarray类型
+        elif isinstance(value, np.ndarray):
+            result[slot] = value.tolist()
+        # 处理列表和元组
+        elif isinstance(value, (list, tuple)):
+            result[slot] = [rosmsg_to_dict(v) for v in value]
+        else:
+            result[slot] = rosmsg_to_dict(value)
+    
+    return result
+
+class ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+    def __init__(self, server_address, RequestHandlerClass, node):
+        super().__init__(server_address, RequestHandlerClass)
+        self.node = node
+
+class HTTPHandler(http.server.BaseHTTPRequestHandler):
+    hello_str = "hello"
+    state = None
+    lidar = None  # 存储LIDAR数据
+    
+    def do_GET(self):
+        parsed_path = urlparse(self.path)
+        if parsed_path.path == "/":
+            help_text = (
+                "欢迎使用轻量级HTTP服务器！\n"
+                "可用接口：\n"
+                "/hello - 简单问候接口\n"
+                "/time - 获取当前时间戳\n"
+                "/state - 获取机器人运动状态(JSON格式)\n"
+                "/lidar - 获取LIDAR点云数据(JSON格式)\n"  # 新增LIDAR接口说明
+            )
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(help_text.encode('utf-8'))
+        
+        elif parsed_path.path == "/hello":
+            query = parse_qs(parsed_path.query)
+            param = query.get('param', [None])[0]
+            response = "hello"
+            if param == "1":
+                response = self.hello_str
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(response.encode('utf-8'))
+        
+        elif parsed_path.path == "/time":
+            now = time.time()
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(str(now).encode('utf-8'))
+        
+        elif parsed_path.path == "/state":
+            try:
+                state = HTTPHandler.state
+                if state is None:
+                    self.send_response(202)
+                    self.send_header('Content-type', 'text/plain; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write('正在等待运动状态消息，请稍后再试'.encode('utf-8'))
+                    return
+                state_dict = rosmsg_to_dict(state)
+                state_json = json.dumps(state_dict, ensure_ascii=False, indent=2)
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(state_json.encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-type', 'text/plain; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(f"状态获取失败: {e}".encode('utf-8'))
+        
+        # 新增：处理LIDAR数据请求
+        elif parsed_path.path == "/lidar":
+            try:
+                lidar_data = HTTPHandler.lidar
+                if lidar_data is None:
+                    self.send_response(202)
+                    self.send_header('Content-type', 'text/plain; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write('正在等待LIDAR点云数据，请稍后再试'.encode('utf-8'))
+                    return
+                
+                # 转换LIDAR数据为字典并序列化
+                lidar_dict = rosmsg_to_dict(lidar_data)
+                lidar_json = json.dumps(lidar_dict, ensure_ascii=False, indent=2)
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(lidar_json.encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-type', 'text/plain; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(f"LIDAR数据获取失败: {e}".encode('utf-8'))
+        
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b'Not Found')
+
+    def do_POST(self):
+        parsed_path = urlparse(self.path)
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length).decode('utf-8')
+        
+        if parsed_path.path == "/hello":
+            HTTPHandler.hello_str = post_data
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(b'Success')
+            
+        elif parsed_path.path == "/sport":
+            try:
+                data = json.loads(post_data)
+                if 'api_id' not in data:
+                    raise ValueError("缺少必要参数: api_id")
+                
+                api_id = data['api_id']
+                parameter = json.dumps(data.get('parameter', {}))
+                binary = data.get('binary', [])
+                
+                self.server.node.publish_request(api_id, parameter, binary)
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'status': 'success',
+                    'message': f'已发布请求，api_id: {api_id}'
+                }).encode('utf-8'))
+                
+            except json.JSONDecodeError:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write('无效的JSON格式'.encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(f"请求处理失败: {str(e)}".encode('utf-8'))
+                
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write('Not Found'.encode('utf-8'))
+
+
+class HttpServer(Node):
+    def __init__(self, name, host='localhost', port=8000):
+        super().__init__(name)
+        self.http_server = ReusableTCPServer((host, port), HTTPHandler, self)
+        self.get_logger().info(f"服务器已启动，监听 {host}:{port}")
+
+        # 运动状态订阅
+        self.sub_state = self.create_subscription(
+            SportModeState,
+            "/sportmodestate",
+            self.state_callback,
+            10
+        )
+        
+        # 新增：LIDAR点云订阅
+        self.sub_lidar = self.create_subscription(
+            PointCloud2,
+            "/livox/lidar",
+            self.lidar_callback,  # 回调函数
+            10  # QoS设置（点云数据量大，可根据需要调整）
+        )
+        
+        self.pub_request = self.create_publisher(
+            Request, 
+            '/api/sport/request', 
+            10
+        )
+        
+        self.http_thread = threading.Thread(
+            target=self.http_serve, 
+            daemon=True
+        )
+        self.http_thread.start()
+
+    def state_callback(self, msg):
+        HTTPHandler.state = msg
+    
+    def lidar_callback(self, msg):
+        """接收LIDAR点云数据并存储"""
+        HTTPHandler.lidar = msg
+    
+    def publish_request(self, api_id, parameter, binary):
+        msg = Request()
+        msg.header = RequestHeader()
+        msg.header.identity = RequestIdentity()
+        
+        msg.header.identity.api_id = api_id
+        msg.parameter = parameter
+        msg.binary = [int(x) & 0xFF for x in binary]
+        
+        self.pub_request.publish(msg)
+        self.get_logger().info(f"已发布请求: api_id={api_id}, parameter={parameter}")
+    
+    def http_serve(self):
+        try:
+            self.http_server.serve_forever()
+        except KeyboardInterrupt:
+            self.get_logger().info("HTTP服务器已关闭")
+        finally:
+            self.http_server.server_close()
+
+
+def start(args=None):
+    rclpy.init(args=args)
+    node = HttpServer("http_server", host=get_local_ip(), port=8000)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("节点已被中断")
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    start()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import requests
+import time
+import json
+import base64
+import numpy as np
+from pynput.keyboard import Listener, Key
+import matplotlib.pyplot as plt
+import threading
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import tkinter as tk
+
+# 确保Matplotlib使用Tkinter后端（主线程安全）
+plt.switch_backend('TkAgg')
+
+def show_pointcloud(json_str):
+    """修正后的点云可视化函数"""
+    try:
+        data = json.loads(json_str)
+        binary_data = base64.b64decode(data["_data"])
+        num_points = data["_width"] * data["_height"]
+        fields = {f["_name"]: (f["_offset"], f["_datatype"]) for f in data["_fields"]}
+        dtype_map = {7: np.float32, 2: np.uint8, 8: np.uint64}
+        
+        # 直接使用NumPy数组存储点云数据（修复列表索引问题）
+        points = np.empty((num_points, 3), dtype=np.float32)
+        
+        for i in range(num_points):
+            point_offset = i * data["_point_step"]
+            # 提取x坐标
+            x = np.frombuffer(
+                binary_data, 
+                dtype=dtype_map[fields["x"][1]],
+                count=1, 
+                offset=point_offset + fields["x"][0]
+            )[0]
+            # 提取y坐标
+            y = np.frombuffer(
+                binary_data, 
+                dtype=dtype_map[fields["y"][1]],
+                count=1, 
+                offset=point_offset + fields["y"][0]
+            )[0]
+            # 提取z坐标
+            z = np.frombuffer(
+                binary_data, 
+                dtype=dtype_map[fields["z"][1]],
+                count=1, 
+                offset=point_offset + fields["z"][0]
+            )[0]
+            points[i] = [x, y, z]
+
+        # 在主线程中创建可视化窗口（修复线程问题）
+        def plot_in_main_thread():
+            root = tk.Tk()
+            root.title("点云可视化")
+            
+            fig = plt.figure(figsize=(10, 10))
+            ax = fig.add_subplot(111, projection='3d')
+            ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=1, alpha=0.6)
+            ax.set_xlabel('X')
+            ax.set_ylabel('Y')
+            ax.set_zlabel('Z')
+            plt.title('PointCloud Visualization')
+            
+            # 将Matplotlib图表嵌入Tkinter窗口
+            canvas = FigureCanvasTkAgg(fig, master=root)
+            canvas.draw()
+            canvas.get_tk_widget().pack()
+            
+            # 添加关闭按钮
+            btn_close = tk.Button(root, text="关闭", command=root.destroy)
+            btn_close.pack()
+            
+            root.mainloop()
+
+        # 如果当前在子线程，切换到主线程执行
+        if threading.current_thread().name != 'MainThread':
+            # 使用Tkinter主线程调度
+            plot_in_main_thread()
+        else:
+            # 已在主线程，直接绘图
+            plot_in_main_thread()
+            
+    except Exception as e:
+        print(f"可视化错误: {str(e)}")
+
+
+ROBOT_SPORT_API_IDS = {
+    "DAMP": 1001,  # 阻尼控制
+    "BALANCESTAND": 1002,  # 平衡站立
+    "STOPMOVE": 1003,  # 停止运动
+    "STANDUP": 1004,  # 站立
+    "STANDDOWN": 1005,  # 站立下降
+    "RECOVERYSTAND": 1006,  # 恢复站立
+    "EULER": 1007,  # 欧拉角控制
+    "MOVE": 1008,  # 移动
+    "SIT": 1009,  # 坐下
+    "RISESIT": 1010,  # 从坐下恢复站立
+    "SWITCHGAIT": 1011,  # 切换步态
+    "TRIGGER": 1012,  # 触发
+    "BODYHEIGHT": 1013,  # 身体高度调整
+    "FOOTRAISEHEIGHT": 1014,  # 脚部抬起高度调整
+    "SPEEDLEVEL": 1015,  # 速度级别调整
+    "HELLO": 1016,  # 打招呼
+    "STRETCH": 1017,  # 伸展
+    "TRAJECTORYFOLLOW": 1018,  # 轨迹跟随
+    "CONTINUOUSGAIT": 1019,  # 连续步态
+    "CONTENT": 1020,  # 内容
+    "WALLOW": 1021,  # 打滚
+    "DANCE1": 1022,  # 舞蹈1
+    "DANCE2": 1023,  # 舞蹈2
+    "GETBODYHEIGHT": 1024,  # 获取身体高度
+    "GETFOOTRAISEHEIGHT": 1025,  # 获取脚部抬起高度
+    "GETSPEEDLEVEL": 1026,  # 获取速度级别
+    "SWITCHJOYSTICK": 1027,  # 切换操纵杆
+    "POSE": 1028,  # 姿态
+    "SCRAPE": 1029,  # 刮擦
+    "FRONTFLIP": 1030,  # 前空翻
+    "FRONTJUMP": 1031,  # 前跳
+    "FRONTPOUNCE": 1032  # 前扑
+}
+
+class UnitreeKeyboardClient:
+    def __init__(self, server_host='192.168.86.110', server_port=8000):
+        self.base_url = f"http://{server_host}:{server_port}"
+        self.running = True  # 程序运行标志
+        
+        # 运动参数（x:前后, y:左右, z:旋转）
+        self.x = 0.0
+        self.y = 0.0
+        self.z = 0.0
+        self.speed = 0.6  # 运动速度系数（可调整灵敏度）
+
+        self.state_data = None
+        self.lidar_data = None
+        self.image_data = None
+        
+        # 指令API ID定义
+        self.API_DAMP = 1001
+        self.API_BALANCE = 1002
+        self.API_STOP = 1003
+        self.API_STAND = 1004
+        self.API_SIT = 1005
+        self.API_MOVE = 1008
+        
+        print("===== 机器狗键盘控制器 =====")
+        print(f"服务端地址: {self.base_url}")
+        print("控制按键:")
+        print("  W: 前进   S: 后退")
+        print("  A: 左移   D: 右移")
+        print("  Q: 左转   E: 右转")
+        print("  B: 平衡站立  K: 坐下")
+        print("  ENTER: 停止运动")
+        print("  R: 查看雷达点云")
+        print("  ESC: 退出程序")
+        print("===========================")
+
+    def send_command(self, api_id, parameter=None, binary=None):
+        """发送指令到服务端"""
+        parameter = parameter or {}
+        binary = binary or []
+        cmd = {
+            "api_id": api_id,
+            "parameter": parameter,
+            "binary": binary
+        }
+        try:
+            response = requests.post(
+                f"{self.base_url}/sport",
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(cmd),
+                timeout=2
+            )
+            if response.status_code != 200:
+                print(f"指令发送失败: {response.text}")
+        except Exception as e:
+            print(f"通信错误: {str(e)}")
+    
+    def send_request(self, name):
+        """请求雷达数据"""
+        try:
+            response = requests.get(
+                f"{self.base_url}/{name}",
+                timeout=5
+            )
+            if response.status_code == 200:
+                self.lidar_data = response.text
+            else:
+                print(f"指令发送失败: {response.text}")
+                self.lidar_data = None
+        except Exception as e:
+            print(f"通信错误: {str(e)}")
+            self.lidar_data = None
+
+    def on_press(self, key):
+        """键盘按下事件处理"""
+        try:
+            if key == Key.esc:  # 退出程序
+                self.running = False
+                return False  # 停止监听
+            
+            key_char = key.char.lower()
+            
+            # 方向控制
+            if key_char == 'w':
+                self.x = self.speed
+            elif key_char == 's':
+                self.x = -self.speed
+            elif key_char == 'a':
+                self.y = self.speed
+            elif key_char == 'd':
+                self.y = -self.speed
+            elif key_char == 'q':
+                self.z = self.speed * 2  # 旋转速度稍快
+            elif key_char == 'e':
+                self.z = -self.speed * 2
+            
+            # 动作控制
+            elif key_char == 'b':
+                print("发送: 平衡站立")
+                self.send_command(self.API_BALANCE)
+            elif key_char == 'k':
+                print("发送: 坐下")
+                self.send_command(self.API_SIT)
+            elif key == Key.enter:
+                print("发送: 停止运动")
+                self.send_command(self.API_STOP)
+            elif key_char == 'r':
+                print("请求：雷达数据")
+                self.send_request("lidar")
+                if self.lidar_data is None:
+                    print("请求超时或失败")
+                else:
+                    # 启动新线程处理可视化（避免阻塞控制线程）
+                    threading.Thread(
+                        target=show_pointcloud,
+                        args=(self.lidar_data,),
+                        daemon=True
+                    ).start()
+                
+        except AttributeError:
+            pass  # 忽略特殊按键（如Shift、Ctrl等）
+
+    def on_release(self, key):
+        """键盘释放事件处理"""
+        try:
+            key_char = key.char.lower()
+            
+            # 释放方向键时重置对应轴参数
+            if key_char in ['w', 's']:
+                self.x = 0.0
+            elif key_char in ['a', 'd']:
+                self.y = 0.0
+            elif key_char in ['q', 'e']:
+                self.z = 0.0
+        except AttributeError:
+            pass
+
+    def start_control(self):
+        """启动控制流程"""
+        # 初始发送站立指令
+        self.send_command(self.API_STAND)
+        time.sleep(2)
+        self.send_command(self.API_BALANCE)
+        print("初始化: 发送站立和平衡站立指令")
+        time.sleep(1)
+        
+        # 启动键盘监听线程
+        listener = Listener(
+            on_press=self.on_press,
+            on_release=self.on_release,
+            daemon=True  # 守护线程，主程序退出时自动结束
+        )
+        listener.start()
+        
+        # 主循环：持续发送运动指令
+        try:
+            while self.running:
+                # 只有当有运动指令时才发送（节省带宽）
+                if self.x != 0 or self.y != 0 or self.z != 0:
+                    self.send_command(
+                        self.API_MOVE,
+                        parameter={"x": self.x, "y": self.y, "z": self.z},
+                        binary=[127]
+                    )
+                else:
+                    self.send_command(self.API_STOP)
+                time.sleep(0.05)  # 控制指令发送频率（20Hz）
+                
+        except KeyboardInterrupt:
+            pass
+        finally:
+            # 程序退出时发送停止和坐下指令
+            self.send_command(self.API_STOP)
+            self.send_command(self.API_SIT)
+            time.sleep(3)
+            self.send_command(self.API_DAMP)
+            print("\n程序退出，已发送停止和坐下指令")
+
+if __name__ == "__main__":
+    client = UnitreeKeyboardClient(server_host='192.168.86.111', server_port=8000)
+    client.start_control()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import requests
+import time
+import json
+import base64
+import numpy as np
+from pynput.keyboard import Listener, Key
+import matplotlib.pyplot as plt
+
+def show_pointcloud(json_str):
+    data = json.loads(json_str)
+    binary_data = base64.b64decode(data["_data"])
+    num_points = data["_width"] * data["_height"]
+    fields = {f["_name"]: (f["_offset"], f["_datatype"]) for f in data["_fields"]}
+    dtype_map = {7: np.float32, 2: np.uint8, 8: np.uint64}
+    points = []
+    for i in range(num_points):
+        # 计算单个点的起始偏移量
+        point_offset = i * data["_point_step"]
+        x = np.frombuffer(
+            binary_data, 
+            dtype=dtype_map[fields["x"][1]],
+            count=1, 
+            offset=point_offset + fields["x"][0]
+        )[0]
+        y = np.frombuffer(
+            binary_data, 
+            dtype=dtype_map[fields["y"][1]],
+            count=1, 
+            offset=point_offset + fields["y"][0]
+        )[0]
+        z = np.frombuffer(
+            binary_data, 
+            dtype=dtype_map[fields["z"][1]],
+            count=1, 
+            offset=point_offset + fields["z"][0]
+        )[0]
+        points.append([x, y, z])
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.scatter(points[:, 0], points[:, 1], points[:, 2], s=1, alpha=0.6)
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    plt.title('PointCloud Visualization')
+    plt.show()
+
+
+ROBOT_SPORT_API_IDS = {
+    "DAMP": 1001,  # 阻尼控制
+    "BALANCESTAND": 1002,  # 平衡站立
+    "STOPMOVE": 1003,  # 停止运动
+    "STANDUP": 1004,  # 站立
+    "STANDDOWN": 1005,  # 站立下降
+    "RECOVERYSTAND": 1006,  # 恢复站立
+    "EULER": 1007,  # 欧拉角控制
+    "MOVE": 1008,  # 移动
+    "SIT": 1009,  # 坐下
+    "RISESIT": 1010,  # 从坐下恢复站立
+    "SWITCHGAIT": 1011,  # 切换步态
+    "TRIGGER": 1012,  # 触发
+    "BODYHEIGHT": 1013,  # 身体高度调整
+    "FOOTRAISEHEIGHT": 1014,  # 脚部抬起高度调整
+    "SPEEDLEVEL": 1015,  # 速度级别调整
+    "HELLO": 1016,  # 打招呼
+    "STRETCH": 1017,  # 伸展
+    "TRAJECTORYFOLLOW": 1018,  # 轨迹跟随
+    "CONTINUOUSGAIT": 1019,  # 连续步态
+    "CONTENT": 1020,  # 内容
+    "WALLOW": 1021,  # 打滚
+    "DANCE1": 1022,  # 舞蹈1
+    "DANCE2": 1023,  # 舞蹈2
+    "GETBODYHEIGHT": 1024,  # 获取身体高度
+    "GETFOOTRAISEHEIGHT": 1025,  # 获取脚部抬起高度
+    "GETSPEEDLEVEL": 1026,  # 获取速度级别
+    "SWITCHJOYSTICK": 1027,  # 切换操纵杆
+    "POSE": 1028,  # 姿态
+    "SCRAPE": 1029,  # 刮擦
+    "FRONTFLIP": 1030,  # 前空翻
+    "FRONTJUMP": 1031,  # 前跳
+    "FRONTPOUNCE": 1032  # 前扑
+}
+
+class UnitreeKeyboardClient:
+    def __init__(self, server_host='192.168.86.110', server_port=8000):
+        self.base_url = f"http://{server_host}:{server_port}"
+        self.running = True  # 程序运行标志
+        
+        # 运动参数（x:前后, y:左右, z:旋转）
+        self.x = 0.0
+        self.y = 0.0
+        self.z = 0.0
+        self.speed = 0.6  # 运动速度系数（可调整灵敏度）
+
+        self.state_data = None
+        self.lidar_data = None
+        self.image_data = None
+        
+        # 指令API ID定义
+        self.API_DAMP = 1001
+        self.API_BALANCE = 1002
+        self.API_STOP = 1003
+        self.API_STAND = 1004
+        self.API_SIT = 1005
+        self.API_MOVE = 1008
+        
+        print("===== 机器狗键盘控制器 =====")
+        print(f"服务端地址: {self.base_url}")
+        print("控制按键:")
+        print("  W: 前进   S: 后退")
+        print("  A: 左移   D: 右移")
+        print("  Q: 左转   E: 右转")
+        print("  B: 平衡站立  K: 坐下")
+        print("  ENTER: 停止运动")
+        print("  ESC: 退出程序")
+        print("===========================")
+
+    def send_command(self, api_id, parameter=None, binary=None):
+        """发送指令到服务端"""
+        parameter = parameter or {}
+        binary = binary or []
+        cmd = {
+            "api_id": api_id,
+            "parameter": parameter,
+            "binary": binary
+        }
+        try:
+            response = requests.post(
+                f"{self.base_url}/sport",
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(cmd),
+                timeout=2
+            )
+            if response.status_code != 200:
+                print(f"指令发送失败: {response.text}")
+        except Exception as e:
+            print(f"通信错误: {str(e)}")
+    
+    def send_request(self, name):
+        try:
+            response = requests.get(
+                f"{self.base_url}/{name}",
+                timeout=5
+            )
+            if response.status_code != 200:
+                print(f"指令发送失败: {response.text}")
+            self.lidar_data = response.text
+        except Exception as e:
+            print(f"通信错误: {str(e)}")
+
+    def on_press(self, key):
+        """键盘按下事件处理"""
+        try:
+            if key == Key.esc:  # 退出程序
+                self.running = False
+                return False  # 停止监听
+            
+            key_char = key.char.lower()
+            
+            # 方向控制
+            if key_char == 'w':
+                self.x = self.speed
+            elif key_char == 's':
+                self.x = -self.speed
+            elif key_char == 'a':
+                self.y = self.speed
+            elif key_char == 'd':
+                self.y = -self.speed
+            elif key_char == 'q':
+                self.z = self.speed * 2  # 旋转速度稍快
+            elif key_char == 'e':
+                self.z = -self.speed * 2
+            
+            # 动作控制
+            elif key_char == 'b':
+                print("发送: 平衡站立")
+                self.send_command(self.API_BALANCE)
+            elif key_char == 'k':
+                print("发送: 坐下")
+                self.send_command(self.API_SIT)
+            elif key_char == 'enter':
+                print("发送: 停止运动")
+                self.send_command(self.API_STOP)
+            elif key_char == 'r':
+                print("请求：雷达数据")
+                self.send_request("lidar")#补充实现雷达点云可视化的功能，每当按下r时也会更新可视化。雷达数据为base64，结构如data所示，解码方法如test.py所示。
+                if self.lidar_data == None:
+                    print("请求超时")
+                else:
+                    show_pointcloud(self.lidar_data)
+                    #print(self.lidar_data[200:400])
+            #elif key_char == 't':
+            #    self.lidar_data = self.send_request("state")
+            #elif key_char == 'y':
+            #    self.lidar_data = self.send_request("image")
+                
+        except AttributeError:
+            pass  # 忽略特殊按键（如Shift、Ctrl等）
+
+    def on_release(self, key):
+        """键盘释放事件处理"""
+        try:
+            key_char = key.char.lower()
+            
+            # 释放方向键时重置对应轴参数
+            if key_char in ['w', 's']:
+                self.x = 0.0
+            elif key_char in ['a', 'd']:
+                self.y = 0.0
+            elif key_char in ['q', 'e']:
+                self.z = 0.0
+        except AttributeError:
+            pass
+
+    def start_control(self):
+        """启动控制流程"""
+        # 初始发送站立指令
+        self.send_command(self.API_STAND)
+        time.sleep(2)
+        self.send_command(self.API_BALANCE)
+        print("初始化: 发送站立和平衡站立指令")
+        time.sleep(1)
+        
+        # 启动键盘监听线程
+        listener = Listener(
+            on_press=self.on_press,
+            on_release=self.on_release,
+            daemon=True  # 守护线程，主程序退出时自动结束
+        )
+        listener.start()
+        
+        # 主循环：持续发送运动指令
+        try:
+            while self.running:
+                # 只有当有运动指令时才发送（节省带宽）
+                if self.x != 0 or self.y != 0 or self.z != 0:
+                    self.send_command(
+                        self.API_MOVE,
+                        parameter={"x": self.x, "y": self.y, "z": self.z},
+                        binary=[127]
+                    )
+                else:
+                    self.send_command(self.API_STOP)
+                time.sleep(0.05)  # 控制指令发送频率（10Hz）
+                
+        except KeyboardInterrupt:
+            pass
+        finally:
+            # 程序退出时发送停止和坐下指令
+            self.send_command(self.API_STOP)
+            self.send_command(self.API_SIT)
+            time.sleep(3)
+            self.send_command(self.API_DAMP)
+            print("\n程序退出，已发送停止和坐下指令")
+
+if __name__ == "__main__":
+    client = UnitreeKeyboardClient(server_host='192.168.86.111', server_port=8000)
+    client.start_control()
+
+
+
+
+
+
+
+
+
+
+
+
+
+                    lidar_json = json.loads(self.lidar_data)
+                    lidar_base = lidar_json.get("_data", "")
+                    lidar_byte = base64.b64decode(lidar_base)
+                    lidar_array = np.frombuffer(lidar_byte, dtype=np.uint8)
+
+
+
+
+
+
+
+
+
+
+
+
+
+import requests
+import time
+import json
+from pynput.keyboard import Listener, Key  # 用于监听键盘事件
+
+ROBOT_SPORT_API_IDS = {
+    "DAMP": 1001,  # 阻尼控制
+    "BALANCESTAND": 1002,  # 平衡站立
+    "STOPMOVE": 1003,  # 停止运动
+    "STANDUP": 1004,  # 站立
+    "STANDDOWN": 1005,  # 站立下降
+    "RECOVERYSTAND": 1006,  # 恢复站立
+    "EULER": 1007,  # 欧拉角控制
+    "MOVE": 1008,  # 移动
+    "SIT": 1009,  # 坐下
+    "RISESIT": 1010,  # 从坐下恢复站立
+    "SWITCHGAIT": 1011,  # 切换步态
+    "TRIGGER": 1012,  # 触发
+    "BODYHEIGHT": 1013,  # 身体高度调整
+    "FOOTRAISEHEIGHT": 1014,  # 脚部抬起高度调整
+    "SPEEDLEVEL": 1015,  # 速度级别调整
+    "HELLO": 1016,  # 打招呼
+    "STRETCH": 1017,  # 伸展
+    "TRAJECTORYFOLLOW": 1018,  # 轨迹跟随
+    "CONTINUOUSGAIT": 1019,  # 连续步态
+    "CONTENT": 1020,  # 内容
+    "WALLOW": 1021,  # 打滚
+    "DANCE1": 1022,  # 舞蹈1
+    "DANCE2": 1023,  # 舞蹈2
+    "GETBODYHEIGHT": 1024,  # 获取身体高度
+    "GETFOOTRAISEHEIGHT": 1025,  # 获取脚部抬起高度
+    "GETSPEEDLEVEL": 1026,  # 获取速度级别
+    "SWITCHJOYSTICK": 1027,  # 切换操纵杆
+    "POSE": 1028,  # 姿态
+    "SCRAPE": 1029,  # 刮擦
+    "FRONTFLIP": 1030,  # 前空翻
+    "FRONTJUMP": 1031,  # 前跳
+    "FRONTPOUNCE": 1032  # 前扑
+}
+
+class UnitreeKeyboardClient:
+    def __init__(self, server_host='192.168.86.110', server_port=8000):
+        self.base_url = f"http://{server_host}:{server_port}"
+        self.running = True  # 程序运行标志
+        
+        # 运动参数（x:前后, y:左右, z:旋转）
+        self.x = 0.0
+        self.y = 0.0
+        self.z = 0.0
+        self.speed = 0.6  # 运动速度系数（可调整灵敏度）
+
+        self.state_data = None
+        self.lidar_data = None
+        self.image_data = None
+        
+        # 指令API ID定义
+        self.API_DAMP = 1001
+        self.API_BALANCE = 1002
+        self.API_STOP = 1003
+        self.API_STAND = 1004
+        self.API_SIT = 1005
+        self.API_MOVE = 1008
+        
+        print("===== 机器狗键盘控制器 =====")
+        print(f"服务端地址: {self.base_url}")
+        print("控制按键:")
+        print("  W: 前进   S: 后退")
+        print("  A: 左移   D: 右移")
+        print("  Q: 左转   E: 右转")
+        print("  B: 平衡站立  K: 坐下")
+        print("  ENTER: 停止运动")
+        print("  ESC: 退出程序")
+        print("===========================")
+
+    def send_command(self, api_id, parameter=None, binary=None):
+        """发送指令到服务端"""
+        parameter = parameter or {}
+        binary = binary or []
+        cmd = {
+            "api_id": api_id,
+            "parameter": parameter,
+            "binary": binary
+        }
+        try:
+            response = requests.post(
+                f"{self.base_url}/sport",
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(cmd),
+                timeout=2
+            )
+            if response.status_code != 200:
+                print(f"指令发送失败: {response.text}")
+        except Exception as e:
+            print(f"通信错误: {str(e)}")
+    
+    def send_request(self, name):
+        try:
+            response = requests.get(
+                f"{self.base_url}/{name}",
+                timeout=2
+            )
+            if response.status_code != 200:
+                print(f"指令发送失败: {response.text}")
+            return response
+        except Exception as e:
+            print(f"通信错误: {str(e)}")
+            return f"{str(e)}"
+
+    def on_press(self, key):
+        """键盘按下事件处理"""
+        try:
+            if key == Key.esc:  # 退出程序
+                self.running = False
+                return False  # 停止监听
+            
+            key_char = key.char.lower()
+            
+            # 方向控制
+            if key_char == 'w':
+                self.x = self.speed
+            elif key_char == 's':
+                self.x = -self.speed
+            elif key_char == 'a':
+                self.y = self.speed
+            elif key_char == 'd':
+                self.y = -self.speed
+            elif key_char == 'q':
+                self.z = self.speed * 2  # 旋转速度稍快
+            elif key_char == 'e':
+                self.z = -self.speed * 2
+            
+            # 动作控制
+            elif key_char == 'b':
+                self.send_command(self.API_BALANCE)
+                print("发送: 平衡站立")
+            elif key_char == 'k':
+                self.send_command(self.API_SIT)
+                print("发送: 坐下")
+            elif key_char == 'enter':
+                self.send_command(self.API_STOP)
+                print("发送: 停止运动")
+            elif key_char == 'r':
+                self.lidar_data = self.send_request("lidar")#补充实现雷达点云可视化的功能，每当按下r时也会更新可视化。雷达数据为base64，结构如data所示，解码方法如test.py所示。
+            #elif key_char == 't':
+            #    self.lidar_data = self.send_request("image")
+            #elif key_char == 'y':
+            #    self.lidar_data = self.send_request("state")
+                
+        except AttributeError:
+            pass  # 忽略特殊按键（如Shift、Ctrl等）
+
+    def on_release(self, key):
+        """键盘释放事件处理"""
+        try:
+            key_char = key.char.lower()
+            
+            # 释放方向键时重置对应轴参数
+            if key_char in ['w', 's']:
+                self.x = 0.0
+            elif key_char in ['a', 'd']:
+                self.y = 0.0
+            elif key_char in ['q', 'e']:
+                self.z = 0.0
+        except AttributeError:
+            pass
+
+    def start_control(self):
+        """启动控制流程"""
+        # 初始发送站立指令
+        self.send_command(self.API_STAND)
+        time.sleep(2)
+        self.send_command(self.API_BALANCE)
+        print("初始化: 发送站立和平衡站立指令")
+        time.sleep(1)
+        
+        # 启动键盘监听线程
+        listener = Listener(
+            on_press=self.on_press,
+            on_release=self.on_release,
+            daemon=True  # 守护线程，主程序退出时自动结束
+        )
+        listener.start()
+        
+        # 主循环：持续发送运动指令
+        try:
+            while self.running:
+                # 只有当有运动指令时才发送（节省带宽）
+                if self.x != 0 or self.y != 0 or self.z != 0:
+                    self.send_command(
+                        self.API_MOVE,
+                        parameter={"x": self.x, "y": self.y, "z": self.z},
+                        binary=[127]
+                    )
+                else:
+                    self.send_command(self.API_STOP)
+                time.sleep(0.05)  # 控制指令发送频率（10Hz）
+                
+        except KeyboardInterrupt:
+            pass
+        finally:
+            # 程序退出时发送停止和坐下指令
+            self.send_command(self.API_STOP)
+            self.send_command(self.API_SIT)
+            time.sleep(3)
+            self.send_command(self.API_DAMP)
+            print("\n程序退出，已发送停止和坐下指令")
+
+if __name__ == "__main__":
+    client = UnitreeKeyboardClient(server_host='192.168.86.111', server_port=8000)
+    client.start_control()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import requests
+import time
+import json
+from pynput.keyboard import Listener, Key  # 用于监听键盘事件
+
+ROBOT_SPORT_API_IDS = {
+    "DAMP": 1001,  # 阻尼控制
+    "BALANCESTAND": 1002,  # 平衡站立
+    "STOPMOVE": 1003,  # 停止运动
+    "STANDUP": 1004,  # 站立
+    "STANDDOWN": 1005,  # 站立下降
+    "RECOVERYSTAND": 1006,  # 恢复站立
+    "EULER": 1007,  # 欧拉角控制
+    "MOVE": 1008,  # 移动
+    "SIT": 1009,  # 坐下
+    "RISESIT": 1010,  # 从坐下恢复站立
+    "SWITCHGAIT": 1011,  # 切换步态
+    "TRIGGER": 1012,  # 触发
+    "BODYHEIGHT": 1013,  # 身体高度调整
+    "FOOTRAISEHEIGHT": 1014,  # 脚部抬起高度调整
+    "SPEEDLEVEL": 1015,  # 速度级别调整
+    "HELLO": 1016,  # 打招呼
+    "STRETCH": 1017,  # 伸展
+    "TRAJECTORYFOLLOW": 1018,  # 轨迹跟随
+    "CONTINUOUSGAIT": 1019,  # 连续步态
+    "CONTENT": 1020,  # 内容
+    "WALLOW": 1021,  # 打滚
+    "DANCE1": 1022,  # 舞蹈1
+    "DANCE2": 1023,  # 舞蹈2
+    "GETBODYHEIGHT": 1024,  # 获取身体高度
+    "GETFOOTRAISEHEIGHT": 1025,  # 获取脚部抬起高度
+    "GETSPEEDLEVEL": 1026,  # 获取速度级别
+    "SWITCHJOYSTICK": 1027,  # 切换操纵杆
+    "POSE": 1028,  # 姿态
+    "SCRAPE": 1029,  # 刮擦
+    "FRONTFLIP": 1030,  # 前空翻
+    "FRONTJUMP": 1031,  # 前跳
+    "FRONTPOUNCE": 1032  # 前扑
+}
+
+class UnitreeKeyboardClient:
+    def __init__(self, server_host='192.168.86.110', server_port=8000):
+        self.base_url = f"http://{server_host}:{server_port}"
+        self.running = True  # 程序运行标志
+        
+        # 运动参数（x:前后, y:左右, z:旋转）
+        self.x = 0.0
+        self.y = 0.0
+        self.z = 0.0
+        self.speed = 0.6  # 运动速度系数（可调整灵敏度）
+
+        self.state_data = None
+        self.lidar_data = None
+        self.image_data = None
+        
+        # 指令API ID定义
+        self.API_DAMP = 1001
+        self.API_BALANCE = 1002
+        self.API_STOP = 1003
+        self.API_STAND = 1004
+        self.API_SIT = 1005
+        self.API_MOVE = 1008
+        
+        print("===== 机器狗键盘控制器 =====")
+        print(f"服务端地址: {self.base_url}")
+        print("控制按键:")
+        print("  W: 前进   S: 后退")
+        print("  A: 左移   D: 右移")
+        print("  Q: 左转   E: 右转")
+        print("  B: 平衡站立  K: 坐下")
+        print("  ENTER: 停止运动")
+        print("  ESC: 退出程序")
+        print("===========================")
+
+    def send_command(self, api_id, parameter=None, binary=None):
+        """发送指令到服务端"""
+        parameter = parameter or {}
+        binary = binary or []
+        cmd = {
+            "api_id": api_id,
+            "parameter": parameter,
+            "binary": binary
+        }
+        try:
+            response = requests.post(
+                f"{self.base_url}/sport",
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(cmd),
+                timeout=2
+            )
+            if response.status_code != 200:
+                print(f"指令发送失败: {response.text}")
+        except Exception as e:
+            print(f"通信错误: {str(e)}")
+    
+    def send_request(self, name):
+        try:
+            response = requests.get(
+                f"{self.base_url}/{name}",
+                timeout=2
+            )
+            if response.status_code != 200:
+                print(f"指令发送失败: {response.text}")
+            return response
+        except Exception as e:
+            print(f"通信错误: {str(e)}")
+            return f"{str(e)}"
+
+    def on_press(self, key):
+        """键盘按下事件处理"""
+        try:
+            if key == Key.esc:  # 退出程序
+                self.running = False
+                return False  # 停止监听
+            
+            key_char = key.char.lower()
+            
+            # 方向控制
+            if key_char == 'w':
+                self.x = self.speed
+            elif key_char == 's':
+                self.x = -self.speed
+            elif key_char == 'a':
+                self.y = self.speed
+            elif key_char == 'd':
+                self.y = -self.speed
+            elif key_char == 'q':
+                self.z = self.speed * 2  # 旋转速度稍快
+            elif key_char == 'e':
+                self.z = -self.speed * 2
+            
+            # 动作控制
+            elif key_char == 'b':
+                self.send_command(self.API_BALANCE)
+                print("发送: 平衡站立")
+            elif key_char == 'k':
+                self.send_command(self.API_SIT)
+                print("发送: 坐下")
+            elif key_char == 'enter':
+                self.send_command(self.API_STOP)
+                print("发送: 停止运动")
+            elif key_char == 'r':
+                self.lidar_data = self.send_request("lidar")
+            #elif key_char == 't':
+            #    self.lidar_data = self.send_request("image")
+            #elif key_char == 'y':
+            #    self.lidar_data = self.send_request("state")
+                
+        except AttributeError:
+            pass  # 忽略特殊按键（如Shift、Ctrl等）
+
+    def on_release(self, key):
+        """键盘释放事件处理"""
+        try:
+            key_char = key.char.lower()
+            
+            # 释放方向键时重置对应轴参数
+            if key_char in ['w', 's']:
+                self.x = 0.0
+            elif key_char in ['a', 'd']:
+                self.y = 0.0
+            elif key_char in ['q', 'e']:
+                self.z = 0.0
+        except AttributeError:
+            pass
+
+    def start_control(self):
+        """启动控制流程"""
+        # 初始发送站立指令
+        self.send_command(self.API_STAND)
+        time.sleep(2)
+        self.send_command(self.API_BALANCE)
+        print("初始化: 发送站立和平衡站立指令")
+        time.sleep(1)
+        
+        # 启动键盘监听线程
+        listener = Listener(
+            on_press=self.on_press,
+            on_release=self.on_release,
+            daemon=True  # 守护线程，主程序退出时自动结束
+        )
+        listener.start()
+        
+        # 主循环：持续发送运动指令
+        try:
+            while self.running:
+                # 只有当有运动指令时才发送（节省带宽）
+                if self.x != 0 or self.y != 0 or self.z != 0:
+                    self.send_command(
+                        self.API_MOVE,
+                        parameter={"x": self.x, "y": self.y, "z": self.z},
+                        binary=[127]
+                    )
+                time.sleep(0.05)  # 控制指令发送频率（10Hz）
+                
+        except KeyboardInterrupt:
+            pass
+        finally:
+            # 程序退出时发送停止和坐下指令
+            self.send_command(self.API_STOP)
+            self.send_command(self.API_SIT)
+            time.sleep(3)
+            self.send_command(self.API_DAMP)
+            print("\n程序退出，已发送停止和坐下指令")
+
+if __name__ == "__main__":
+    client = UnitreeKeyboardClient(server_host='192.168.86.110', server_port=8000)
+    client.start_control()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def rosmsg_to_dict(msg):
+    """增强版ROS消息转字典，对LIDAR二进制数据进行Base64编码"""
+    # 处理ndarray类型
+    if isinstance(msg, np.ndarray):
+        return msg.tolist()
+    
+    # 处理基本类型
+    if not hasattr(msg, '__slots__'):
+        if isinstance(msg, (list, tuple)):
+            return [rosmsg_to_dict(v) for v in msg]
+        return msg
+    
+    result = {}
+    for slot in msg.__slots__:
+        value = getattr(msg, slot)
+        
+        # 处理PointField类型（LIDAR字段描述）
+        if isinstance(value, PointField):
+            result[slot] = {
+                'name': value.name,
+                'offset': value.offset,
+                'datatype': value.datatype,
+                'count': value.count
+            }
+        # 对PointCloud2的data字段进行Base64编码
+        elif isinstance(value, array.array):
+            result[slot] = base64.b64encode(value.tobytes()).decode('utf-8')
+        # 处理ndarray类型
+        elif isinstance(value, np.ndarray):
+            result[slot] = value.tolist()
+        # 处理TimeSpec类型
+        elif slot == 'stamp' and hasattr(value, 'sec') and hasattr(value, 'nsec'):
+            result[slot] = {
+                'sec': value.sec,
+                'nsec': value.nsec
+            }
+        # 处理IMUState类型
+        elif slot == 'imu_state' and hasattr(value, 'quaternion'):
+            result[slot] = {
+                'quaternion': rosmsg_to_dict(value.quaternion),
+                'gyro': rosmsg_to_dict(value.gyro),
+                'accel': rosmsg_to_dict(value.accel),
+                'rpy': rosmsg_to_dict(value.rpy),
+                'temperature': value.temperature
+            }
+        # 处理列表和元组
+        elif isinstance(value, (list, tuple)):
+            result[slot] = [rosmsg_to_dict(v) for v in value]
+        else:
+            result[slot] = rosmsg_to_dict(value)
+    
+    return result
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def rosmsg_to_dict(msg):
+    """增强版ROS消息转字典，支持PointCloud2和PointField类型"""
+    # 处理ndarray类型
+    if isinstance(msg, np.ndarray):
+        return msg.tolist()
+    
+    # 处理基本类型
+    if not hasattr(msg, '__slots__'):
+        if isinstance(msg, (list, tuple)):
+            return [rosmsg_to_dict(v) for v in msg]
+        return msg
+    
+    result = {}
+    for slot in msg.__slots__:
+        value = getattr(msg, slot)
+        
+        # 处理PointField类型（LIDAR字段描述）
+        if isinstance(value, PointField):
+            result[slot] = {
+                'name': value.name,
+                'offset': value.offset,
+                'datatype': value.datatype,
+                'count': value.count
+            }
+        # 处理ndarray类型
+        elif isinstance(value, np.ndarray):
+            result[slot] = value.tolist()
+        # 处理TimeSpec类型
+        elif slot == 'stamp' and hasattr(value, 'sec') and hasattr(value, 'nsec'):
+            result[slot] = {
+                'sec': value.sec,
+                'nsec': value.nsec
+            }
+        # 处理IMUState类型
+        elif slot == 'imu_state' and hasattr(value, 'quaternion'):
+            result[slot] = {
+                'quaternion': rosmsg_to_dict(value.quaternion),
+                'gyro': rosmsg_to_dict(value.gyro),
+                'accel': rosmsg_to_dict(value.accel),
+                'rpy': rosmsg_to_dict(value.rpy),
+                'temperature': value.temperature
+            }
+        # 处理PointCloud2的data字段（二进制数据转为列表）
+        elif slot == 'data' and isinstance(value, bytes):
+            result[slot] = list(value)  # 二进制字节转为整数列表
+        # 处理列表和元组
+        elif isinstance(value, (list, tuple)):
+            result[slot] = [rosmsg_to_dict(v) for v in value]
+        else:
+            result[slot] = rosmsg_to_dict(value)
+    
+    return result
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import http.server
+import socket
+import socketserver
+import time
+import json
+import threading
+import numpy as np
+from urllib.parse import urlparse, parse_qs
+
+import rclpy
+from rclpy.node import Node
+
+from unitree_go.msg import SportModeState
+from unitree_api.msg import Request
+from unitree_api.msg import RequestHeader
+from unitree_api.msg import RequestIdentity
+
+def get_local_ip():
+    """获取当前设备的非回环IPv4地址"""
+    try:
+        # 创建临时socket连接，用于检测默认出口IP
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            # 不需要实际连接，仅用于获取本地IP
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            return ip
+    except Exception:
+        # 如果上述方法失败，遍历所有网络接口
+        interfaces = socket.getaddrinfo(socket.gethostname(), None)
+        for addr in interfaces:
+            ip = addr[4][0]
+            # 过滤回环地址和IPv6地址
+            if ip.startswith("127.") or ":" in ip:
+                continue
+            return ip
+    # 所有方法失败，返回0.0.0.0（允许所有接口）
+    return "0.0.0.0"
+
+def rosmsg_to_dict(msg):
+    """将ROS消息转换为字典，支持嵌套类型和ndarray转换"""
+    # 处理ndarray类型，转换为普通列表
+    if isinstance(msg, np.ndarray):
+        return msg.tolist()
+    
+    # 处理基本类型
+    if not hasattr(msg, '__slots__'):
+        if isinstance(msg, (list, tuple)):
+            return [rosmsg_to_dict(v) for v in msg]
+        return msg
+    
+    result = {}
+    for slot in msg.__slots__:
+        value = getattr(msg, slot)
+        
+        # 处理ndarray类型
+        if isinstance(value, np.ndarray):
+            result[slot] = value.tolist()
+        # 处理TimeSpec类型
+        elif slot == 'stamp' and hasattr(value, 'sec') and hasattr(value, 'nsec'):
+            result[slot] = {
+                'sec': value.sec,
+                'nsec': value.nsec
+            }
+        # 处理IMUState类型
+        elif slot == 'imu_state' and hasattr(value, 'quaternion'):
+            result[slot] = {
+                'quaternion': rosmsg_to_dict(value.quaternion),
+                'gyro': rosmsg_to_dict(value.gyro),
+                'accel': rosmsg_to_dict(value.accel),
+                'rpy': rosmsg_to_dict(value.rpy),
+                'temperature': value.temperature
+            }
+        elif isinstance(value, (list, tuple)):
+            result[slot] = [rosmsg_to_dict(v) for v in value]
+        else:
+            result[slot] = rosmsg_to_dict(value)  # 递归处理所有值
+    
+    return result
+
+class ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+    # 添加节点引用，以便在Handler中访问
+    def __init__(self, server_address, RequestHandlerClass, node):
+        super().__init__(server_address, RequestHandlerClass)
+        self.node = node
+
+class HTTPHandler(http.server.BaseHTTPRequestHandler):
+    hello_str = "hello"
+    state = None
+    lidar = None
+    
+    def do_GET(self):
+        parsed_path = urlparse(self.path)
+        if parsed_path.path == "/":
+            help_text = (
+                "欢迎使用轻量级HTTP服务器！\n"
+                "可用接口：\n"
+                "/hello - 简单问候接口\n"
+                "/time - 获取当前时间戳\n"
+                "/state - 获取机器人运动状态(JSON格式)\n"
+            )
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(help_text.encode('utf-8'))
+        
+        elif parsed_path.path == "/hello":
+            query = parse_qs(parsed_path.query)
+            param = query.get('param', [None])[0]
+            response = "hello"
+            if param == "1":
+                response = self.hello_str
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(response.encode('utf-8'))
+        
+        elif parsed_path.path == "/time":
+            now = time.time()
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(str(now).encode('utf-8'))
+        
+        elif parsed_path.path == "/state":
+            try:
+                state = HTTPHandler.state
+                if state is None:
+                    self.send_response(202)
+                    self.send_header('Content-type', 'text/plain; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write('正在等待运动状态消息，请稍后再试'.encode('utf-8'))
+                    return
+                state_dict = rosmsg_to_dict(state)
+                state_json = json.dumps(state_dict, ensure_ascii=False, indent=2)
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(state_json.encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-type', 'text/plain; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(f"状态获取失败: {e}".encode('utf-8'))
+        elif parsed_path.path == "/lidar":
+            pass
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b'Not Found')
+
+    def do_POST(self):
+        parsed_path = urlparse(self.path)
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length).decode('utf-8')
+        
+        if parsed_path.path == "/hello":
+            HTTPHandler.hello_str = post_data
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(b'Success')
+            
+        elif parsed_path.path == "/sport":
+            try:
+                # 解析POST数据为JSON
+                data = json.loads(post_data)
+                
+                # 验证必要参数
+                if 'api_id' not in data:
+                    raise ValueError("缺少必要参数: api_id")
+                
+                # 提取参数，设置默认值
+                api_id = data['api_id']
+                parameter = json.dumps(data.get('parameter', {}))  # 确保是JSON字符串
+                binary = data.get('binary', [])
+                
+                # 通过服务器获取节点引用并发布消息
+                self.server.node.publish_request(api_id, parameter, binary)
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'status': 'success',
+                    'message': f'已发布请求，api_id: {api_id}'
+                }).encode('utf-8'))
+                
+            except json.JSONDecodeError:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write('无效的JSON格式'.encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(f"请求处理失败: {str(e)}".encode('utf-8'))
+                
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write('Not Found'.encode('utf-8'))
+
+
+class HttpServer(Node):
+    def __init__(self, name, host='localhost', port=8000):
+        super().__init__(name)
+        # 初始化服务器时传入节点引用
+        self.http_server = ReusableTCPServer((host, port), HTTPHandler, self)
+        self.get_logger().info(f"服务器已启动，监听 {host}:{port}")
+
+        self.sub_state = self.create_subscription(
+            SportModeState,
+            "/sportmodestate",
+            self.state_callback,
+            10
+        )
+        self.pub_request = self.create_publisher(
+            Request, 
+            '/api/sport/request', 
+            10  # QoS配置
+        )
+        
+        # 创建HTTP服务器线程
+        self.http_thread = threading.Thread(
+            target=self.http_serve, 
+            daemon=True
+        )
+        self.http_thread.start()
+
+    def state_callback(self, msg):
+        HTTPHandler.state = msg
+    
+    def publish_request(self, api_id, parameter, binary):
+        # 完善消息结构构建
+        msg = Request()
+        msg.header = RequestHeader()
+        msg.header.identity = RequestIdentity()
+        
+        msg.header.identity.api_id = api_id
+        msg.parameter = parameter
+        # 确保binary是uint8类型的列表
+        msg.binary = [int(x) & 0xFF for x in binary]  # 确保值在0-255范围内
+        
+        self.pub_request.publish(msg)
+        self.get_logger().info(f"已发布请求: api_id={api_id}, parameter={parameter}")
+    
+    def http_serve(self):
+        try:
+            self.http_server.serve_forever()
+        except KeyboardInterrupt:
+            self.get_logger().info("HTTP服务器已关闭")
+        finally:
+            self.http_server.server_close()
+
+
+def start(args=None):
+    rclpy.init(args=args)
+    #node = HttpServer("http_server", host='192.168.86.110', port=8000)
+    node = HttpServer("http_server", host=get_local_ip(), port=8000)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("节点已被中断")
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+import http.server
+import socket
+import socketserver
+import time
+import json
+import threading
+import numpy as np
+from urllib.parse import urlparse, parse_qs
+
+import rclpy
+from rclpy.node import Node
+
+from unitree_go.msg import SportModeState
+from unitree_api.msg import Request
+from unitree_api.msg import RequestHeader
+from unitree_api.msg import RequestIdentity
+
+def get_local_ip():
+    """获取当前设备的非回环IPv4地址"""
+    try:
+        # 创建临时socket连接，用于检测默认出口IP
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            # 不需要实际连接，仅用于获取本地IP
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            return ip
+    except Exception:
+        # 如果上述方法失败，遍历所有网络接口
+        interfaces = socket.getaddrinfo(socket.gethostname(), None)
+        for addr in interfaces:
+            ip = addr[4][0]
+            # 过滤回环地址和IPv6地址
+            if ip.startswith("127.") or ":" in ip:
+                continue
+            return ip
+    # 所有方法失败，返回0.0.0.0（允许所有接口）
+    return "0.0.0.0"
+
+def rosmsg_to_dict(msg):
+    """将ROS消息转换为字典，支持嵌套类型和ndarray转换"""
+    # 处理ndarray类型，转换为普通列表
+    if isinstance(msg, np.ndarray):
+        return msg.tolist()
+    
+    # 处理基本类型
+    if not hasattr(msg, '__slots__'):
+        if isinstance(msg, (list, tuple)):
+            return [rosmsg_to_dict(v) for v in msg]
+        return msg
+    
+    result = {}
+    for slot in msg.__slots__:
+        value = getattr(msg, slot)
+        
+        # 处理ndarray类型
+        if isinstance(value, np.ndarray):
+            result[slot] = value.tolist()
+        # 处理TimeSpec类型
+        elif slot == 'stamp' and hasattr(value, 'sec') and hasattr(value, 'nsec'):
+            result[slot] = {
+                'sec': value.sec,
+                'nsec': value.nsec
+            }
+        # 处理IMUState类型
+        elif slot == 'imu_state' and hasattr(value, 'quaternion'):
+            result[slot] = {
+                'quaternion': rosmsg_to_dict(value.quaternion),
+                'gyro': rosmsg_to_dict(value.gyro),
+                'accel': rosmsg_to_dict(value.accel),
+                'rpy': rosmsg_to_dict(value.rpy),
+                'temperature': value.temperature
+            }
+        elif isinstance(value, (list, tuple)):
+            result[slot] = [rosmsg_to_dict(v) for v in value]
+        else:
+            result[slot] = rosmsg_to_dict(value)  # 递归处理所有值
+    
+    return result
+
+class ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+    # 添加节点引用，以便在Handler中访问
+    def __init__(self, server_address, RequestHandlerClass, node):
+        super().__init__(server_address, RequestHandlerClass)
+        self.node = node
+
+class HTTPHandler(http.server.BaseHTTPRequestHandler):
+    hello_str = "hello"
+    state = None
+    
+    def do_GET(self):
+        parsed_path = urlparse(self.path)
+        if parsed_path.path == "/":
+            help_text = (
+                "欢迎使用轻量级HTTP服务器！\n"
+                "可用接口：\n"
+                "/hello - 简单问候接口\n"
+                "/time - 获取当前时间戳\n"
+                "/state - 获取机器人运动状态(JSON格式)\n"
+            )
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(help_text.encode('utf-8'))
+        
+        elif parsed_path.path == "/hello":
+            query = parse_qs(parsed_path.query)
+            param = query.get('param', [None])[0]
+            response = "hello"
+            if param == "1":
+                response = self.hello_str
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(response.encode('utf-8'))
+        
+        elif parsed_path.path == "/time":
+            now = time.time()
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(str(now).encode('utf-8'))
+        
+        elif parsed_path.path == "/state":
+            try:
+                state = HTTPHandler.state
+                if state is None:
+                    self.send_response(202)
+                    self.send_header('Content-type', 'text/plain; charset=utf-8')
+                    self.end_headers()
+                    self.wfile.write('正在等待运动状态消息，请稍后再试'.encode('utf-8'))
+                    return
+                state_dict = rosmsg_to_dict(state)
+                state_json = json.dumps(state_dict, ensure_ascii=False, indent=2)
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(state_json.encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-type', 'text/plain; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(f"状态获取失败: {e}".encode('utf-8'))
+        
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b'Not Found')
+
+    def do_POST(self):
+        parsed_path = urlparse(self.path)
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length).decode('utf-8')
+        
+        if parsed_path.path == "/hello":
+            HTTPHandler.hello_str = post_data
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(b'Success')
+            
+        elif parsed_path.path == "/sport":
+            try:
+                # 解析POST数据为JSON
+                data = json.loads(post_data)
+                
+                # 验证必要参数
+                if 'api_id' not in data:
+                    raise ValueError("缺少必要参数: api_id")
+                
+                # 提取参数，设置默认值
+                api_id = data['api_id']
+                parameter = json.dumps(data.get('parameter', {}))  # 确保是JSON字符串
+                binary = data.get('binary', [])
+                
+                # 通过服务器获取节点引用并发布消息
+                self.server.node.publish_request(api_id, parameter, binary)
+                
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'status': 'success',
+                    'message': f'已发布请求，api_id: {api_id}'
+                }).encode('utf-8'))
+                
+            except json.JSONDecodeError:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write('无效的JSON格式'.encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(f"请求处理失败: {str(e)}".encode('utf-8'))
+                
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write('Not Found'.encode('utf-8'))
+
+
+class HttpServer(Node):
+    def __init__(self, name, host='localhost', port=8000):
+        super().__init__(name)
+        # 初始化服务器时传入节点引用
+        self.http_server = ReusableTCPServer((host, port), HTTPHandler, self)
+        self.get_logger().info(f"服务器已启动，监听 {host}:{port}")
+
+        self.sub_state = self.create_subscription(
+            SportModeState,
+            "/sportmodestate",
+            self.state_callback,
+            10
+        )
+        self.pub_request = self.create_publisher(
+            Request, 
+            '/api/sport/request', 
+            10  # QoS配置
+        )
+        
+        # 创建HTTP服务器线程
+        self.http_thread = threading.Thread(
+            target=self.http_serve, 
+            daemon=True
+        )
+        self.http_thread.start()
+
+    def state_callback(self, msg):
+        HTTPHandler.state = msg
+    
+    def publish_request(self, api_id, parameter, binary):
+        # 完善消息结构构建
+        msg = Request()
+        msg.header = RequestHeader()
+        msg.header.identity = RequestIdentity()
+        
+        msg.header.identity.api_id = api_id
+        msg.parameter = parameter
+        # 确保binary是uint8类型的列表
+        msg.binary = [int(x) & 0xFF for x in binary]  # 确保值在0-255范围内
+        
+        self.pub_request.publish(msg)
+        self.get_logger().info(f"已发布请求: api_id={api_id}, parameter={parameter}")
+    
+    def http_serve(self):
+        try:
+            self.http_server.serve_forever()
+        except KeyboardInterrupt:
+            self.get_logger().info("HTTP服务器已关闭")
+        finally:
+            self.http_server.server_close()
+
+
+def start(args=None):
+    rclpy.init(args=args)
+    #node = HttpServer("http_server", host='192.168.86.111', port=8000)
+    node = HttpServer("http_server", host=get_local_ip(), port=8000)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("节点已被中断")
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+'''
+import requests
+import time
+import json
+
+class UnitreeHTTPClient:
+    def __init__(self, server_host='192.168.86.110', server_port=8000):
+        self.base_url = f"http://{server_host}:{server_port}"
+        # 指令列表与服务端/sport接口要求完全匹配
+        self.cmd_list = [
+            # 站立 (api_id: 1004)
+            {
+                "api_id": 1004,
+                "parameter": {},  # 空参数对象，服务端会转为""
+                "binary": []       # 空二进制列表
+            },
+            # 平衡站立 (api_id: 1002)
+            {
+                "api_id": 1002,
+                "parameter": {},
+                "binary": []
+            },
+            # 移动 (api_id: 1008) - 带参数和二进制数据
+            {
+                "api_id": 1008,
+                "parameter": {"x": 0.0, "y": 0.0, "z": 1.5},  # 服务端会转为JSON字符串
+                "binary": [127]                               # 符合uint8范围
+            },
+            # 停止移动 (api_id: 1003)
+            {
+                "api_id": 1003,
+                "parameter": {},
+                "binary": []
+            },
+            # 坐下 (api_id: 1005)
+            {
+                "api_id": 1005,
+                "parameter": {},
+                "binary": []
+            }
+        ]
+        print(f"客户端已初始化，服务端地址: {self.base_url}")
+
+    def get_state(self):
+        """获取机器人状态，匹配服务端/state接口"""
+        try:
+            response = requests.get(f"{self.base_url}/state", timeout=5)
+            
+            # 处理服务端定义的状态码：200（成功）、202（等待状态）、500（错误）
+            if response.status_code == 200:
+                return response.json()  # 返回解析后的状态字典
+            elif response.status_code == 202:
+                print(f"服务端提示: {response.text}")
+                return None
+            else:
+                print(f"状态获取失败 [状态码: {response.status_code}]: {response.text}")
+                return None
+        except Exception as e:
+            print(f"状态请求异常: {str(e)}")
+            return None
+
+    def send_sport_command(self, cmd):
+        """发送运动指令，严格匹配服务端/sport接口要求"""
+        try:
+            # 服务端要求Content-Type为application/json
+            headers = {"Content-Type": "application/json"}
+            response = requests.post(
+                f"{self.base_url}/sport",
+                data=json.dumps(cmd),  # 序列化指令为JSON字符串
+                headers=headers,
+                timeout=5
+            )
+            
+            # 处理服务端定义的响应：200（成功）、400（JSON错误）、500（处理失败）
+            if response.status_code == 200:
+                return response.json()  # 返回服务端的成功确认
+            elif response.status_code == 400:
+                print(f"指令格式错误: {response.text}")
+                return None
+            else:
+                print(f"指令发送失败 [状态码: {response.status_code}]: {response.text}")
+                return None
+        except Exception as e:
+            print(f"指令请求异常: {str(e)}")
+            return None
+
+    def run(self):
+        """完整交互流程：获取状态→发送指令序列→实时反馈"""
+        # 1. 先获取初始状态（最多尝试5次，匹配服务端可能的等待状态）
+        print("\n===== 获取初始状态 =====")
+        for _ in range(5):
+            state = self.get_state()
+            if state:
+                print("成功获取状态，关键信息:")
+                print(f"  模式: {state.get('mode')}")
+                print(f"  身体高度: {state.get('body_height', 0):.2f}m")
+                print(f"  位置: {state.get('position', [])}")
+                break
+            time.sleep(1)  # 间隔1秒重试
+
+        # 2. 按顺序发送指令（与原终端命令的wait_sec=2.0保持一致）
+        print("\n===== 开始发送指令序列 =====")
+        for i, cmd in enumerate(self.cmd_list, 1):
+            print(f"\n----- 指令 {i}/{len(self.cmd_list)} -----")
+            print(f"发送内容: {cmd}")
+            
+            # 发送指令并获取服务端确认
+            result = self.send_sport_command(cmd)
+            if result and result["status"] == "success":
+                print(f"服务端确认: {result['message']}")
+            else:
+                print("指令发送失败，继续下一条")
+            
+            # 等待2秒（与服务端处理节奏匹配）
+            print("等待2秒...")
+            time.sleep(2)
+            
+            # 3. 每次指令后获取状态（匹配服务端的状态更新频率）
+            state = self.get_state()
+            if state:
+                print("当前状态更新:")
+                print(state)
+
+        print("\n===== 指令序列执行完成 =====")
+
+if __name__ == "__main__":
+    # 初始化客户端（地址与服务端host:port严格一致）
+    client = UnitreeHTTPClient(server_host='192.168.86.110', server_port=8000)
+    client.run()
+'''
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+'''
+import http.server
+import socketserver
+import time
+import json
+import threading
+import numpy as np
+from urllib.parse import urlparse, parse_qs
+
+import rclpy
+from rclpy.node import Node
+
+from unitree_go.msg import SportModeState
+from unitree_api.msg import Request
+
+def rosmsg_to_dict(msg):
+    """将ROS消息转换为字典，支持嵌套类型和ndarray转换"""
+    # 处理ndarray类型，转换为普通列表
+    if isinstance(msg, np.ndarray):
+        return msg.tolist()
+    
+    # 处理基本类型
+    if not hasattr(msg, '__slots__'):
+        if isinstance(msg, (list, tuple)):
+            return [rosmsg_to_dict(v) for v in msg]
+        return msg
+    
+    result = {}
+    for slot in msg.__slots__:
+        value = getattr(msg, slot)
+        
+        # 处理ndarray类型
+        if isinstance(value, np.ndarray):
+            result[slot] = value.tolist()
+        # 处理TimeSpec类型
+        elif slot == 'stamp' and hasattr(value, 'sec') and hasattr(value, 'nsec'):
+            result[slot] = {
+                'sec': value.sec,
+                'nsec': value.nsec
+            }
+        # 处理IMUState类型
+        elif slot == 'imu_state' and hasattr(value, 'quaternion'):
+            result[slot] = {
+                'quaternion': rosmsg_to_dict(value.quaternion),
+                'gyro': rosmsg_to_dict(value.gyro),
+                'accel': rosmsg_to_dict(value.accel),
+                'rpy': rosmsg_to_dict(value.rpy),
+                'temperature': value.temperature
+            }
+        elif isinstance(value, (list, tuple)):
+            result[slot] = [rosmsg_to_dict(v) for v in value]
+        else:
+            result[slot] = rosmsg_to_dict(value)  # 递归处理所有值
+    
+    return result
+
+class ReusableTCPServer(socketserver.TCPServer):
+    allow_reuse_address = True
+
+class HTTPHandler(http.server.BaseHTTPRequestHandler):
+    hello_str = "hello"
+    state = None
+    def do_GET(self):
+        parsed_path = urlparse(self.path)
+        if parsed_path.path == "/":
+            help_text = (
+                "欢迎使用轻量级HTTP服务器！"
+            )
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(help_text.encode('utf-8'))
+        
+        if parsed_path.path == "/hello":
+            query = parse_qs(parsed_path.query)
+            param = query.get('param', [None])[0]
+            response = "hello"
+            if param == "1":
+                response = self.hello_str
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(response.encode('utf-8'))
+        
+        elif parsed_path.path == "/time":
+            now = time.time()
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(str(now).encode('utf-8'))
+        
+        elif parsed_path.path == "/state":
+            try:
+                state = HTTPHandler.state
+                if state is None:
+                    raise ValueError("尚未收到运动状态消息")
+                state_dict = rosmsg_to_dict(state)
+                state_json = json.dumps(state_dict, ensure_ascii=False, indent=2)
+                self.send_response(200)
+                self.send_header('Content-type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(state_json.encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-type', 'text/plain; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(f"状态获取失败: {e}".encode('utf-8'))
+        
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b'Not Found')
+
+    def do_POST(self):
+        parsed_path = urlparse(self.path)
+        if parsed_path.path == "/hello":
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length).decode('utf-8')
+            HTTPHandler.hello_str = post_data
+            self.send_response(200)
+            self.send_header('Content-type', 'text/plain; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(b'Success')
+        elif parsed_path.path == "/sport":
+            pass
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b'Not Found')
+
+
+class HttpServer(Node):
+    def __init__(self, name, host='localhost', port=8000):
+        super().__init__(name)
+        self.http_server = ReusableTCPServer((host, port), HTTPHandler)
+        self.get_logger().info(f"\n服务器已启动，监听 {host}:{port}")
+
+        self.sub_state = self.create_subscription(
+            SportModeState,
+            "/sportmodestate",
+            self.state_callback,
+            10
+        )
+        self.pub_request = self.create_publisher(
+            Request, 
+            '/api/sport/request', 
+            10  # QoS配置
+        )
+        
+        # 创建HTTP服务器线程
+        self.http_thread = threading.Thread(
+            target=self.http_serve, 
+            daemon=True  # 当主线程退出时自动结束
+        )
+        self.http_thread.start()
+
+    def state_callback(self, msg):
+        HTTPHandler.state = msg
+    
+    def publish_request(self, api_id, parameter, binary):
+        msg = Request()
+        
+        # 仅设置必要的字段
+        msg.header.identity.api_id = api_id  # 核心业务字段
+        msg.parameter = parameter  # 业务参数
+        msg.binary = binary  # 必要的二进制数据
+        self.pub_request.publish(msg)
+        self.get_logger().info(f"已发布简化请求: api_id={msg.header.identity.api_id}")
+    
+    def http_serve(self):
+        try:
+            self.http_server.serve_forever()
+        except KeyboardInterrupt:
+            self.get_logger().info("\n服务器已关闭。")
+        finally:
+            self.http_server.server_close()
+
+
+
+def start(args=None):
+    rclpy.init(args=args)
+    node = HttpServer("http_server", host='192.168.86.110', port=8000)
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+'''
