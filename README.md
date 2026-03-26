@@ -25,7 +25,7 @@
 ## 快速启动
 
 ```bash
-cd /home/ly/songxinshuai/navigation_sdk
+cd navigation_sdk
 python -m venv .venv
 source .venv/bin/activate
 pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
@@ -39,7 +39,7 @@ python -m navigation_mcp.server
 或安装后：
 
 ```bash
-cd /home/ly/songxinshuai/navigation_sdk
+cd navigation_sdk
 pip install -e .
 go2-navigation-mcp
 ```
@@ -50,7 +50,7 @@ go2-navigation-mcp
 {
   "command": "python",
   "args": ["-m", "navigation_mcp.server"],
-  "cwd": "/home/ly/songxinshuai/navigation_sdk"
+  "cwd": "navigation_sdk"
 }
 ```
 
@@ -143,7 +143,7 @@ go2-navigation-mcp
 1. 启动 MCP：
 
 ```bash
-cd /home/ly/songxinshuai/navigation_sdk
+cd navigation_sdk
 source .venv/bin/activate
 python -m navigation_mcp.server
 ```
@@ -174,27 +174,27 @@ python -m navigation_mcp.server
 
 下面这份配置对应当前已确认的环境：
 
-- 主机局域网 IP：`192.168.86.106`
-- 机器狗 IP：`192.168.86.26`
+- 主机局域网 IP：`xxx.xxx.xx.xxx`
+- 机器狗 IP：`xxx.xxx.xx.xx`
 - SSH 用户：`unitree`
-- SSH 密码：`123`
-- sudo 密码：`123`
+- SSH 密码：`xx`
+- sudo 密码：`xx`
 - ROS 选择：`foxy`，即 `1`
 
 ```json
 {
-  "host_bind": "192.168.86.106",
+  "host_bind": "xxx.xxx.xx.xxx",
   "video_port": 5220,
   "state_port": 5222,
   "occupancy_port": 5223,
   "depth_port": 5224,
   "motion_port": 8000,
 
-  "ssh_host": "192.168.86.26",
+  "ssh_host": "xxx.xxx.xx.xxx",
   "ssh_user": "unitree",
-  "ssh_password": "123",
+  "ssh_password": "xx",
   "remote_ros_choice": "1",
-  "remote_sudo_password": "123",
+  "remote_sudo_password": "xx",
 
   "remote_project_dir": "/home/unitree/navigation_sdk",
   "remote_python": "python3",
@@ -263,7 +263,7 @@ python -m navigation_mcp.server
 
 ## 搜索旋转策略
 
-当前默认搜索策略会在每次未检测到目标时顺时针旋转 `45` 度，再做下一次检测；整圈共 `8` 次离散搜索。这样比之前每次 `90` 度、共 `4` 次的策略更不容易因为角度采样过粗或实机转向误差而漏检。
+当前默认搜索策略会在每次未检测到目标时顺时针旋转 `45` 度，再做下一次检测；整圈共 `8` 次离散搜索。
 
 ## 当前机器人端 SDK 依赖
 
